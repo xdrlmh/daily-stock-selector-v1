@@ -248,6 +248,96 @@ def fetch_history_kline(code: str, days: int = 60) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def fetch_market_overview() -> Dict[str, Any]:
+    """
+    获取大盘环境（基于上证指数 000001.SH）：
+    - index_close: 收盘点位
+    - index_pct_change: 当日涨跌幅（%）
+    - main_net_inflow_yi: 大盘主力净额（亿元，moneyflow 全市场 sum）
+    - trend_60d: 60日趋势分类
+      取值：'up'（上涨）/'down'（下跌）/'sideways'（震荡）/'unknown'（数据不足）
+    - trend_detail: 趋势详情字符串（MA20/MA60 等）
+    - data_date: 数据日期
+    """
+    print('📡 抓取大盘环境（上证指数）...')
+    result: Dict[str, Any] = {
+        'index_close': None,
+        'index_pct_change': None,
+        'main_net_inflow_yi': None,
+        'trend_60d': 'unknown',
+        'trend_detail': '',
+        'data_date': '',
+    }
+    try:
+        pro = _init_tushare()
+        trade_date = _get_trade_dates(pro, [0])[0]
+        result['data_date'] = trade_date
+
+        # 1. 上证指数当日行情
+        idx_today = pro.index_daily(ts_code='000001.SH', trade_date=trade_date)
+        if idx_today is not None and not idx_today.empty:
+            row = idx_today.iloc[0]
+            result['index_close'] = float(row['close'])
+            result['index_pct_change'] = float(row['pct_chg'])
+            print(f'  ✅ 上证指数: {row["close"]:.2f} ({row["pct_chg"]:+.2f}%)')
+        else:
+            print('  ⚠️ 上证指数当日行情为空')
+
+        # 2. 上证指数60日 K线 → MA20/MA60 趋势判断
+        start_date = (datetime.now() - timedelta(days=130)).strftime('%Y%m%d')
+        idx_hist = pro.index_daily(ts_code='000001.SH', start_date=start_date, end_date=trade_date)
+        if idx_hist is not None and len(idx_hist) >= 60:
+            closes = idx_hist.sort_values('trade_date')['close'].astype(float).values
+            closes = closes[-60:]  # 取最近60个交易日
+            ma20 = float(closes[-20:].mean())
+            ma60 = float(closes.mean())
+            ma_diff_pct = (ma20 - ma60) / ma60 * 100
+            current = float(closes[-1])
+
+            if ma_diff_pct > 2.0 and current > ma20:
+                result['trend_60d'] = 'up'
+                emoji = '📈'
+                label = '上涨趋势'
+            elif ma_diff_pct < -2.0 and current < ma20:
+                result['trend_60d'] = 'down'
+                emoji = '📉'
+                label = '下跌趋势'
+            else:
+                result['trend_60d'] = 'sideways'
+                emoji = '〰️'
+                label = '震荡整理'
+
+            result['trend_detail'] = (
+                f'{emoji}{label} '
+                f'(MA20={ma20:.0f} vs MA60={ma60:.0f}, 偏离 {ma_diff_pct:+.1f}%)'
+            )
+            print(f'  ✅ 60日趋势: {result["trend_detail"]}')
+        else:
+            print(f'  ⚠️ 上证指数60日数据不足（仅 {0 if idx_hist is None else len(idx_hist)} 条）')
+
+        # 3. 全市场主力净额（moneyflow 大单合计）
+        mf = pro.moneyflow(trade_date=trade_date)
+        if mf is not None and not mf.empty:
+            # buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount = 大单净额（万元）
+            # 主力 = 大单 + 特大单
+            big_net_wan = (
+                mf['buy_lg_amount'].fillna(0).sum()
+                + mf['buy_elg_amount'].fillna(0).sum()
+                - mf['sell_lg_amount'].fillna(0).sum()
+                - mf['sell_elg_amount'].fillna(0).sum()
+            )
+            result['main_net_inflow_yi'] = big_net_wan / 1e4  # 万 → 亿
+            print(f'  ✅ 大盘主力净额: {result["main_net_inflow_yi"]:+.1f} 亿')
+        else:
+            print('  ⚠️ 资金流数据为空')
+
+    except Exception as e:
+        print(f'  ❌ 抓取大盘环境失败: {e}')
+        import traceback
+        traceback.print_exc()
+    return result
+
+
 if __name__ == '__main__':
     spot = fetch_market_spot()
     print(f'\n全市场行情: {len(spot)} 条')
