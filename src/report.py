@@ -223,15 +223,17 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
         lines.append(f'- {p}')
     lines.append('')
 
-    # TOP 精选（紧凑卡片式：钉钉手机端 9 列表格会错乱，改用每行一条 + 分隔符）
+    # TOP 表格（9 列宽表格：用户反馈此版更顺眼，钉钉手机端虽偶有堆叠但可读性更高）
     lines.append(f'## 📋 TOP {len(top_picks)} 精选')
     lines.append('')
     if not top_picks.empty:
+        lines.append('| # | 代码 | 名称 | 现价 | 当日 | **60日** | 主力净额 | 评分 | 关键 |')
+        lines.append('|---|---|---|---|---|---|---|---|---|')
         for i, (_, row) in enumerate(top_picks.iterrows(), 1):
-            medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else f'{i}.'
+            medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
             inflow = format_yi(row.get('main_net_inflow', 0))
             score = f'{row["total_score"]:.0f}'
-            # 关键特征：取题材；无题材则用当日涨幅
+            # 关键特征：取题材 + 当日涨幅
             catalyst = ''
             for k, v in row.get('score_breakdown', {}).items():
                 if k == '题材':
@@ -239,10 +241,10 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
                     break
             catalyst = catalyst if catalyst else f'{format_pct(row.get("pct_change", 0))}'
             lines.append(
-                f'{medal} **{row["code"]} {row["name"]}** | '
-                f'{format_price(row["price"])} 元 | 当日 {format_pct(row["pct_change"])} | '
-                f'**60日 {format_pct(row.get("pct_60d", 0))}** | '
-                f'主力 {inflow} | **评分 {score}** | {catalyst}'
+                f'| {medal} | {row["code"]} | {row["name"]} | '
+                f'{format_price(row["price"])} | {format_pct(row["pct_change"])} | '
+                f'**{format_pct(row.get("pct_60d", 0))}** | '
+                f'{inflow} | {score} | {catalyst} |'
             )
         lines.append('')
 
