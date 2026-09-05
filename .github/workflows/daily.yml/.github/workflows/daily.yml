@@ -1,0 +1,38 @@
+name: 主升浪日报推送
+
+on:
+  schedule:
+    - cron: '45 0 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      test_only:
+        description: '仅测试推送，不做实际选股'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  stock-push:
+    name: 主升浪选股并推送到钉钉
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行选股并推送
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          TEST_ONLY: ${{ github.event.inputs.test_only }}
+        run: python main.py
