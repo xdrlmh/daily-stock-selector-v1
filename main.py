@@ -27,6 +27,7 @@ from src.config import DINGTALK_WEBHOOK, DINGTALK_SECRET, TEST_ONLY, REPORTS_DIR
 from src.data_fetcher import (
     fetch_market_spot, fetch_fund_flow_rank,
     filter_main_board, enrich_with_fund_flow,
+    fetch_market_overview,
 )
 from src.selector import screen_stocks, fallback_from_top_gainers
 from src.report import generate_dingtalk_payload, save_full_report
@@ -88,21 +89,26 @@ def main():
     # 7. 生成报告
     date_str = datetime.now().strftime('%Y-%m-%d')
 
-    # 7.1 钉钉消息 payload
+    # 7.1 大盘环境（上证指数 + 主力净额 + 60日趋势）
+    market = fetch_market_overview()
+
+    # 7.2 钉钉消息 payload
     dingtalk_payload = generate_dingtalk_payload(
         date_str=date_str,
         top_picks=top_picks,
         warnings=warnings,
         all_stocks=all_scored.head(50),
+        market=market,
     )
 
-    # 7.2 完整报告（保存到 reports/）
+    # 7.3 完整报告（保存到 reports/）
     full_report_path = save_full_report(
         date_str=date_str,
         top_picks=top_picks,
         warnings=warnings,
         all_stocks=all_scored.head(50),
         reports_dir=REPORTS_DIR,
+        market=market,
     )
     log.info(f'完整报告已保存：{full_report_path}')
 
