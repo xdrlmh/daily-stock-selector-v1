@@ -1,8 +1,7 @@
 # 主升浪日报 - Python 依赖
-# 数据源：akshare（A 股公开数据，无需注册）
-# 推送通道：Server酱（POST 请求，仅需 requests）
-akshare>=1.13.0
+# 数据源：Tushare（正规金融数据 API，需 TUSHARE_TOKEN）
+# 推送通道：钉钉群机器人（POST 请求，需 requests）
+tushare>=1.4.0
 pandas>=2.0.0
 numpy>=1.24.0
 requests>=2.31.0
-pyyaml>=6.0
