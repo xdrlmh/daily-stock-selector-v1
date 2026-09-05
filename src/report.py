@@ -6,7 +6,7 @@
 """
 import json
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 import pandas as pd
 from pathlib import Path
 
@@ -184,8 +184,43 @@ def generate_action_tips(row: pd.Series) -> str:
     return '｜'.join(tips[:3]) + f'。{conclusion}。'
 
 
+def generate_market_section(market: Dict[str, Any]) -> List[str]:
+    """
+    生成「大盘环境」markdown 段（上证指数 + 主力净额 + 60日趋势）
+    返回纯 markdown 行列表（不含标题与分隔），由调用方拼到 payload 中
+    """
+    lines = []
+    idx_close = market.get('index_close')
+    idx_pct = market.get('index_pct_change')
+    main_yi = market.get('main_net_inflow_yi')
+    trend = market.get('trend_60d', 'unknown')
+    trend_detail = market.get('trend_detail', '')
+
+    # 上证指数一行
+    if idx_close is not None:
+        lines.append(f'- **上证指数**：{idx_close:.2f}（{format_pct(idx_pct)}）')
+    else:
+        lines.append('- **上证指数**：数据缺失')
+
+    # 主力净额一行
+    if main_yi is not None:
+        emoji = '🟢' if main_yi >= 0 else '🔴'
+        lines.append(f'- **大盘主力**：{emoji} {main_yi:+.1f} 亿')
+    else:
+        lines.append('- **大盘主力**：数据缺失')
+
+    # 60日趋势一行
+    if trend != 'unknown' and trend_detail:
+        lines.append(f'- **60日趋势**：{trend_detail}')
+    else:
+        lines.append('- **60日趋势**：数据不足')
+
+    return lines
+
+
 def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
-                                warnings: pd.DataFrame, all_stocks: pd.DataFrame) -> Dict:
+                                warnings: pd.DataFrame, all_stocks: pd.DataFrame,
+                                market: Dict[str, Any] = None) -> Dict:
     """
     生成钉钉消息 payload
 
@@ -214,6 +249,13 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
     lines.append(f'> 🕐 生成时间：{datetime.now().strftime("%H:%M")}')
     lines.append(f'> 🎯 筛选：主板非ST / 趋势向上 / 主力流入')
     lines.append('')
+
+    # 大盘环境（基于上证指数）
+    if market is not None:
+        lines.append('## 📊 大盘环境')
+        lines.append('')
+        lines.extend(generate_market_section(market))
+        lines.append('')
 
     # 今日重点
     lines.append('## 📲 今日重点')
@@ -319,7 +361,8 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
 
 def save_full_report(date_str: str, top_picks: pd.DataFrame,
                     warnings: pd.DataFrame, all_stocks: pd.DataFrame,
-                    reports_dir: Path) -> str:
+                    reports_dir: Path,
+                    market: Dict[str, Any] = None) -> str:
     """
     生成完整版 Markdown 报告（保存到 reports/ 目录做历史记录）
     """
@@ -329,6 +372,13 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
     lines.append(f'> 数据时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} · 数据源：Tushare')
     lines.append(f'> 筛选：沪深主板 / 非ST / 趋势向上 / 主力流入')
     lines.append('')
+
+    # 大盘环境
+    if market is not None:
+        lines.append('## 📊 大盘环境（上证指数）')
+        lines.append('')
+        lines.extend(generate_market_section(market))
+        lines.append('')
 
     # 评分维度说明
     lines.append('## 🎯 评分维度（满分 100）')
