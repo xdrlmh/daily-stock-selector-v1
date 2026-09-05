@@ -2,7 +2,7 @@ name: 主升浪日报推送
 
 on:
   schedule:
-    - cron: '45 0 * * 1-5'
+    - cron: '15 0 * * 1-5'  # 北京时间 08:15（开盘前 30 分钟），比之前提前 30 分钟
   workflow_dispatch:
     inputs:
       test_only:
