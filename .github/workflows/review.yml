@@ -1,0 +1,47 @@
+name: 主升浪盘后复盘
+
+on:
+  schedule:
+    - cron: '30 7 * * 1-5'  # 北京时间 15:30（收盘后 30 分钟），与早盘 08:15 互补
+  workflow_dispatch:
+    inputs:
+      test_only:
+        description: '仅测试推送，不做实际选股'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  review-push:
+    name: 主升浪盘后复盘并推送到钉钉
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行盘后复盘并推送
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          TEST_ONLY: ${{ github.event.inputs.test_only }}
+        run: python main_review.py
+
+      - name: 上传当日复盘报告（历史追溯）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-report-${{ github.run_id }}
+          path: reports/主升浪复盘_*.md
+          retention-days: 90
+          if-no-files-found: warn
