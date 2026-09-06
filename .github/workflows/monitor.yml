@@ -1,0 +1,48 @@
+name: 持仓止盈止损监控
+
+on:
+  schedule:
+    # 北京时间 09:30-15:00 每 30 分钟一次（盘中 12 次）
+    # UTC 01:30-07:30, step 30min → cron: '30 1-7 * * 1-5' + '0 2-7 * * 1-5'
+    - cron: '30 1-7 * * 1-5'
+    - cron: '0 2-7 * * 1-5'
+  workflow_dispatch:  # 支持手动触发测试
+
+permissions:
+  contents: write  # 需要写 portfolio.json
+
+jobs:
+  monitor:
+    name: 监控持仓止盈止损
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行持仓监控
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+        run: python main_monitor.py
+
+      - name: 提交持仓池变更回仓库
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/portfolio.json
+          if git diff --staged --quiet; then
+            echo "持仓池无变化，跳过提交"
+          else
+            git commit -m "chore: 更新持仓池 $(date +'%Y-%m-%d %H:%M')"
+            git push
+          fi
