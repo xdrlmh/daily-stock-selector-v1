@@ -338,6 +338,124 @@ def fetch_market_overview() -> Dict[str, Any]:
     return result
 
 
+def fetch_market_review() -> Dict[str, Any]:
+    """
+    获取盘后复盘所需的大盘环境 + 市场情绪数据（全部基于 Tushare）：
+    - index_close: 上证指数收盘点位
+    - index_pct_change: 当日涨跌幅（%）
+    - main_net_inflow_yi: 大盘主力净额（亿元）
+    - trend_60d / trend_detail: 60日趋势分类
+    - amount_yi: 两市成交总额（亿元）
+    - limit_up_count: 涨停家数（约，pct_chg >= 9.8）
+    - limit_down_count: 跌停家数（约，pct_chg <= -9.8）
+    - up_count / down_count: 上涨/下跌家数
+    - data_date: 数据日期
+    """
+    print('📡 抓取盘后复盘（大盘环境 + 市场情绪）...')
+    result: Dict[str, Any] = {
+        'index_close': None,
+        'index_pct_change': None,
+        'main_net_inflow_yi': None,
+        'trend_60d': 'unknown',
+        'trend_detail': '',
+        'amount_yi': None,
+        'limit_up_count': None,
+        'limit_down_count': None,
+        'up_count': None,
+        'down_count': None,
+        'data_date': '',
+    }
+    try:
+        pro = _init_tushare()
+        trade_date = _get_trade_dates(pro, [0])[0]
+        result['data_date'] = trade_date
+
+        # 1. 上证指数当日行情
+        try:
+            idx_today = pro.index_daily(ts_code='000001.SH', trade_date=trade_date)
+            if idx_today is not None and not idx_today.empty:
+                row = idx_today.iloc[0]
+                result['index_close'] = float(row['close'])
+                result['index_pct_change'] = float(row['pct_chg'])
+                print(f'  ✅ 上证指数: {row["close"]:.2f} ({row["pct_chg"]:+.2f}%)')
+            else:
+                print('  ⚠️ 上证指数当日行情为空')
+        except Exception as e:
+            print(f'  ⚠️ 上证指数失败: {e}')
+
+        # 2. 上证指数60日 K线 → MA20/MA60 趋势判断
+        try:
+            start_date = (datetime.now() - timedelta(days=130)).strftime('%Y%m%d')
+            idx_hist = pro.index_daily(ts_code='000001.SH', start_date=start_date, end_date=trade_date)
+            if idx_hist is not None and len(idx_hist) >= 60:
+                closes = idx_hist.sort_values('trade_date')['close'].astype(float).values
+                closes = closes[-60:]
+                ma20 = float(closes[-20:].mean())
+                ma60 = float(closes.mean())
+                ma_diff_pct = (ma20 - ma60) / ma60 * 100
+                current = float(closes[-1])
+                if ma_diff_pct > 2.0 and current > ma20:
+                    result['trend_60d'] = 'up'
+                    emoji, label = '📈', '上涨趋势'
+                elif ma_diff_pct < -2.0 and current < ma20:
+                    result['trend_60d'] = 'down'
+                    emoji, label = '📉', '下跌趋势'
+                else:
+                    result['trend_60d'] = 'sideways'
+                    emoji, label = '〰️', '震荡整理'
+                result['trend_detail'] = (
+                    f'{emoji}{label} '
+                    f'(MA20={ma20:.0f} vs MA60={ma60:.0f}, 偏离 {ma_diff_pct:+.1f}%)'
+                )
+                print(f'  ✅ 60日趋势: {result["trend_detail"]}')
+            else:
+                print(f'  ⚠️ 上证指数60日数据不足（仅 {0 if idx_hist is None else len(idx_hist)} 条）')
+        except Exception as e:
+            print(f'  ⚠️ 60日趋势失败: {e}')
+
+        # 3. 全市场主力净额（moneyflow 大单+特大单，单位万→亿）
+        try:
+            mf = pro.moneyflow(trade_date=trade_date)
+            if mf is not None and not mf.empty:
+                big_net_wan = (
+                    mf['buy_lg_amount'].fillna(0).sum()
+                    + mf['buy_elg_amount'].fillna(0).sum()
+                    - mf['sell_lg_amount'].fillna(0).sum()
+                    - mf['sell_elg_amount'].fillna(0).sum()
+                )
+                result['main_net_inflow_yi'] = big_net_wan / 1e4
+                print(f'  ✅ 大盘主力净额: {result["main_net_inflow_yi"]:+.1f} 亿')
+            else:
+                print('  ⚠️ 资金流数据为空')
+        except Exception as e:
+            print(f'  ⚠️ 大盘主力净额失败: {e}')
+
+        # 4. 全市场日线：成交额 + 涨跌停家数 + 涨跌家数
+        try:
+            daily_today = pro.daily(trade_date=trade_date)
+            if daily_today is not None and not daily_today.empty:
+                # 成交额：Tushare daily 的 amount 单位为千元 → 元×1000 → 亿/1e5
+                result['amount_yi'] = daily_today['amount'].sum() / 1e5
+                pct = daily_today['pct_chg'].fillna(0)
+                result['limit_up_count'] = int((pct >= 9.8).sum())
+                result['limit_down_count'] = int((pct <= -9.8).sum())
+                result['up_count'] = int((pct > 0).sum())
+                result['down_count'] = int((pct < 0).sum())
+                print(f"  ✅ 两市成交额: {result['amount_yi']:.0f} 亿 | "
+                      f"涨停 {result['limit_up_count']} | 跌停 {result['limit_down_count']} | "
+                      f"涨 {result['up_count']} | 跌 {result['down_count']}")
+            else:
+                print('  ⚠️ 全市场日线为空')
+        except Exception as e:
+            print(f'  ⚠️ 市场情绪抓取失败: {e}')
+
+    except Exception as e:
+        print(f'  ❌ 抓取盘后复盘失败: {e}')
+        import traceback
+        traceback.print_exc()
+    return result
+
+
 if __name__ == '__main__':
     spot = fetch_market_spot()
     print(f'\n全市场行情: {len(spot)} 条')
