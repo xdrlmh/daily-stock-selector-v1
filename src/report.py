@@ -359,6 +359,154 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
     }
 
 
+def generate_outlook(market: Dict[str, Any], sector_heat: List[Dict]) -> List[str]:
+    """根据大盘趋势与板块温度生成『明日展望』要点"""
+    lines = []
+    trend = market.get('trend_60d', 'unknown')
+    main_yi = market.get('main_net_inflow_yi')
+
+    # 1) 大盘趋势判断
+    if trend == 'up':
+        lines.append('- 大盘处于**上升通道**，可关注强势板块的**低吸**机会')
+    elif trend == 'down':
+        lines.append('- 大盘**走弱**，建议**控制仓位**，谨慎追高')
+    elif trend == 'sideways':
+        lines.append('- 大盘**震荡整理**，以**板块轮动**思路操作，高抛低吸')
+    else:
+        lines.append('- 大盘趋势**待确认**，建议观望为主')
+
+    # 2) 主力资金方向
+    if main_yi is not None:
+        if main_yi > 50:
+            lines.append(f'- 主力资金**大幅流入**（{main_yi:+.0f}亿），做多情绪回暖')
+        elif main_yi > 0:
+            lines.append(f'- 主力资金**温和流入**（{main_yi:+.0f}亿），题材有承接')
+        elif main_yi > -50:
+            lines.append(f'- 主力资金**小幅流出**（{main_yi:+.0f}亿），注意规避高位板块')
+        else:
+            lines.append(f'- 主力资金**大幅流出**（{main_yi:+.0f}亿），谨防踩踏')
+
+    # 3) 板块温度头部
+    if sector_heat:
+        top = sector_heat[0]
+        lines.append(
+            f'- 资金聚焦 **{top["theme"]}**（平均涨幅 {top["avg_pct"]:+.1f}%），'
+            f'明日可优先跟踪该板块的**龙头分歧转一致**机会'
+        )
+
+    # 4) 风险提示
+    if main_yi is not None and main_yi < -50:
+        lines.append('> ⚠️ 大盘资金面偏弱，建议压缩仓位、精选确定性标的')
+
+    return lines
+
+
+def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
+                            warnings: pd.DataFrame, all_stocks: pd.DataFrame,
+                            market: Dict[str, Any] = None,
+                            sector_heat: List[Dict] = None) -> Dict:
+    """
+    生成「主升浪盘后复盘」钉钉消息 payload（15:30 推送）
+    核心模块：
+    - 大盘复盘（指数/主力/趋势/成交额/市场情绪）
+    - 今日强势股 TOP5（收盘后五维评分重筛）
+    - 板块温度 TOP3（按题材聚合力强板块）
+    - 明日展望
+    """
+    lines = []
+    lines.append(f'# 📊 主升浪盘后复盘 {date_str}')
+    lines.append('')
+    lines.append(f'> 📡 数据源：Tushare')
+    lines.append(f'> 🕐 生成时间：{datetime.now().strftime("%H:%M")} · 视角：当日复盘')
+    lines.append('')
+
+    # ---- 大盘复盘 ----
+    lines.append('## 📊 大盘复盘')
+    lines.append('')
+    if market is not None:
+        lines.extend(generate_market_section(market))
+
+        amount_yi = market.get('amount_yi')
+        if amount_yi is not None:
+            if amount_yi >= 12000:
+                vol_label = f'量能充沛' + ('' if amount_yi >= 15000 else '（偏高）')
+            elif amount_yi >= 8000:
+                vol_label = '量能温和'
+            else:
+                vol_label = '量能偏弱'
+            lines.append(f'- **两市成交额**：{amount_yi:.0f} 亿（{vol_label}）')
+        else:
+            lines.append('- **两市成交额**：数据缺失')
+
+        # 市场情绪：涨跌停家数 + 涨跌家数
+        lu = market.get('limit_up_count')
+        ld = market.get('limit_down_count')
+        up = market.get('up_count')
+        down = market.get('down_count')
+        if lu is not None and up is not None:
+            lines.append(f'- **市场情绪**：涨停 {lu} ｜ 跌停 {ld or 0} ｜ 涨跌比 {up}:{down}')
+        lines.append('')
+
+    # ---- 今日强势股 TOP5（收盘后）----
+    lines.append(f'## 📋 今日强势股 TOP {len(top_picks)}（收盘后）')
+    lines.append('')
+    if not top_picks.empty:
+        lines.append('| # | 代码 | 名称 | 现价 | 当日 | 主力净额 | 评分 | 关键 |')
+        lines.append('|---|---|---|---|---|---|---|---|')
+        for i, (_, row) in enumerate(top_picks.iterrows(), 1):
+            medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
+            inflow = format_yi(row.get('main_net_inflow', 0))
+            score = f'{row["total_score"]:.0f}'
+            catalyst = ''
+            for k, v in row.get('score_breakdown', {}).items():
+                if k == '题材':
+                    catalyst = v.split(' ')[0]
+                    break
+            catalyst = catalyst if catalyst else f'{format_pct(row.get("pct_change", 0))}'
+            lines.append(
+                f'| {medal} | {row["code"]} | {row["name"]} | '
+                f'{format_price(row["price"])} | {format_pct(row["pct_change"])} | '
+                f'{inflow} | {score} | {catalyst} |'
+            )
+        lines.append('')
+
+    # ---- 板块温度 TOP3 ----
+    if sector_heat:
+        lines.append('## 🔥 板块温度 TOP3')
+        lines.append('')
+        for i, sector in enumerate(sector_heat, 1):
+            medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
+            emoji_up = '🟢' if sector['avg_pct'] >= 0 else '🔴'
+            lines.append(
+                f'- {medal} **{sector["theme"]}** - {emoji_up}平均涨幅 {sector["avg_pct"]:+.1f}% ｜ '
+                f'主力 {sector["inflow_yi"]:+.1f}亿 ｜ 涨停 {sector["limit_up"]}只'
+            )
+        lines.append('')
+
+    # ---- 明日展望 ----
+    lines.append('## 💡 明日展望')
+    lines.append('')
+    outlook = generate_outlook(market or {}, sector_heat or [])
+    for o in outlook:
+        lines.append(o)
+    lines.append('')
+
+    # ---- 免责声明 ----
+    lines.append('---')
+    lines.append('')
+    lines.append('⚠️ **免责声明**：以上内容由 AI 基于 Tushare 公开数据自动生成，'
+                 '仅供参考，不构成任何投资建议。投资有风险，决策需谨慎。')
+
+    text = '\n'.join(lines)
+    return {
+        'msgtype': 'markdown',
+        'markdown': {
+            'title': f'📊 主升浪复盘 {date_str}',
+            'text': text,
+        }
+    }
+
+
 def save_full_report(date_str: str, top_picks: pd.DataFrame,
                     warnings: pd.DataFrame, all_stocks: pd.DataFrame,
                     reports_dir: Path,
@@ -475,6 +623,100 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(content)
 
+    return str(report_path)
+
+
+def save_review_report(date_str: str, top_picks: pd.DataFrame,
+                       warnings: pd.DataFrame, all_stocks: pd.DataFrame,
+                       market: Dict[str, Any] = None,
+                       sector_heat: List[Dict] = None,
+                       reports_dir: Path = None) -> str:
+    """
+    生成完整版盘后复盘 Markdown 报告（保存到 reports/ 目录做历史记录）
+    """
+    if reports_dir is None:
+        reports_dir = Path('reports')
+    lines = []
+    lines.append(f'# 📊 主升浪盘后复盘 {date_str}')
+    lines.append('')
+    lines.append(f'> 数据时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} · 数据源：Tushare')
+    lines.append('')
+
+    # 大盘复盘
+    if market is not None:
+        lines.append('## 📊 大盘复盘')
+        lines.append('')
+        lines.extend(generate_market_section(market))
+        amount_yi = market.get('amount_yi')
+        lu = market.get('limit_up_count')
+        ld = market.get('limit_down_count')
+        up = market.get('up_count')
+        down = market.get('down_count')
+        if amount_yi is not None:
+            lines.append(f'- **两市成交额**：{amount_yi:.0f} 亿')
+        if lu is not None and up is not None:
+            lines.append(f'- **市场情绪**：涨停 {lu} ｜ 跌停 {ld or 0} ｜ 涨跌比 {up}:{down}')
+        lines.append('')
+
+    # 今日强势股 TOP5
+    lines.append(f'## 📋 今日强势股 TOP {len(top_picks)}（收盘后）')
+    lines.append('')
+    if not top_picks.empty:
+        for i, (_, row) in enumerate(top_picks.iterrows(), 1):
+            medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else f'**{i}**'
+            lines.append(f'### {medal} {row["name"]} ({row["code"]})')
+            lines.append('')
+            lines.append(f'- 现价：**{format_price(row["price"])}** 元')
+            lines.append(f'- 当日涨幅：{format_pct(row["pct_change"])}')
+            lines.append(f'- 60日涨跌幅：{format_pct(row.get("pct_60d", 0))}')
+            lines.append(f'- 换手率：{row.get("turnover_rate", 0):.2f}%')
+            lines.append(f'- 量比：{row.get("volume_ratio", 0):.2f}')
+            lines.append(f'- PE-TTM：{row.get("pe_ttm", "-"):.1f}')
+            lines.append(f'- 流通市值：{row.get("circ_mcap", 0)/1e8:.1f}亿')
+            lines.append(f'- 主力净流入：{format_yi(row.get("main_net_inflow", 0))}')
+            lines.append('')
+            lines.append(f'**综合评分：{row["total_score"]:.0f}/100**')
+            lines.append('')
+            breakdown = row.get('score_breakdown', {})
+            lines.append('<details>')
+            lines.append('<summary>📊 评分明细</summary>')
+            lines.append('')
+            for k, v in breakdown.items():
+                lines.append(f'- {k}：{v}')
+            lines.append('')
+            lines.append('</details>')
+            lines.append('')
+
+    # 板块温度
+    if sector_heat:
+        lines.append('## 🔥 板块温度 TOP3')
+        lines.append('')
+        for i, sector in enumerate(sector_heat, 1):
+            medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
+            lines.append(
+                f'- {medal} **{sector["theme"]}** - 平均涨幅 {sector["avg_pct"]:+.1f}% ｜ '
+                f'主力 {sector["inflow_yi"]:+.1f}亿 ｜ 涨停 {sector["limit_up"]}只'
+            )
+        lines.append('')
+
+    # 明日展望
+    lines.append('## 💡 明日展望')
+    lines.append('')
+    outlook = generate_outlook(market or {}, sector_heat or [])
+    for o in outlook:
+        lines.append(o)
+    lines.append('')
+
+    # 免责声明
+    lines.append('---')
+    lines.append('')
+    lines.append('⚠️ **免责声明**：以上内容由 AI 基于 Tushare 公开数据自动生成，仅供参考，'
+                 '不构成任何投资建议。投资有风险，决策需谨慎。')
+
+    content = '\n'.join(lines)
+    report_path = reports_dir / f'主升浪复盘_{date_str}.md'
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(content)
     return str(report_path)
 
 
