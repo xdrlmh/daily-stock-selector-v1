@@ -392,6 +392,71 @@ def screen_stocks(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Data
 
 
 # ============================================================
+# 盘后复盘：板块温度分析
+# ============================================================
+def tag_theme(name: str) -> str:
+    """按股票名称匹配热门题材，未匹配返回『其他』"""
+    name = str(name)
+    for theme, keywords in HOT_THEMES.items():
+        for kw in keywords:
+            if kw in name:
+                return theme
+    return '其他'
+
+
+def analyze_sector_heat(df: pd.DataFrame, top_n: int = 3) -> List[Dict]:
+    """
+    基于当日全市场数据，按题材聚类计算板块温度，返回 TOP 板块。
+    每个板块统计：
+    - avg_pct: 平均涨幅（%）
+    - inflow_yi: 主力净流入合计（亿）
+    - limit_up: 涨停家数（pct_chg >= 9.8）
+    - cnt: 板块内股票数
+    - strength: 强度分 = 平均涨幅*0.4 + max(主力流入,0)*0.3 + 涨停数*0.3
+
+    返回 [{'theme','avg_pct','inflow_yi','limit_up','cnt','strength'}, ...] 按 strength 降序
+    """
+    if df is None or df.empty:
+        return []
+
+    df = df.copy()
+    if 'code' in df.columns:
+        df['code'] = df['code'].astype(str).str.zfill(6)
+    # 打题材标签
+    df['theme'] = df['name'].astype(str).apply(tag_theme)
+    # 排除未匹配题材的股票
+    df = df[df['theme'] != '其他']
+    if df.empty:
+        return []
+
+    # 确保数值列可用
+    df['pct_change'] = pd.to_numeric(df.get('pct_change', 0), errors='coerce').fillna(0)
+    if 'main_net_inflow' not in df.columns:
+        df['main_net_inflow'] = 0.0
+    df['main_net_inflow'] = pd.to_numeric(df['main_net_inflow'], errors='coerce').fillna(0)
+
+    result = []
+    for theme, g in df.groupby('theme'):
+        avg_pct = float(g['pct_change'].mean())
+        inflow_yi = float(g['main_net_inflow'].sum()) / 1e8
+        limit_up = int((g['pct_change'] >= 9.8).sum())
+        cnt = len(g)
+        # 强度分（加权，capture 板块整体热度）
+        strength = avg_pct * 0.4 + max(inflow_yi, 0) * 0.3 + limit_up * 0.3
+        result.append({
+            'theme': theme,
+            'avg_pct': round(avg_pct, 2),
+            'inflow_yi': round(inflow_yi, 1),
+            'limit_up': limit_up,
+            'cnt': cnt,
+            'strength': round(strength, 2),
+        })
+
+    result.sort(key=lambda x: x['strength'], reverse=True)
+    return result[:top_n]
+
+
+# ============================================================
 # 兜底：如果候选不足，从涨跌幅榜补齐
 # ============================================================
 def fallback_from_top_gainers(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
