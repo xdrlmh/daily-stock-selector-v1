@@ -32,6 +32,7 @@ from src.data_fetcher import (
 from src.selector import screen_stocks, fallback_from_top_gainers
 from src.report import generate_dingtalk_payload, save_full_report
 from src.dingtalk import push_to_dingtalk
+from src.portfolio import add_top3_from_screening, get_active_holdings
 
 
 # 日志配置
@@ -125,6 +126,13 @@ def main():
             log.info(f'✅ 钉钉推送成功：{msg}')
         else:
             log.error(f'❌ 钉钉推送失败：{msg}')
+
+    # 8.5 自动写入持仓池（TOP 3 监控）
+    if not top_picks.empty:
+        added = add_top3_from_screening(top_picks)
+        log.info(f'🛒 持仓池新增 {added} 只（TOP 3）')
+        active = get_active_holdings()
+        log.info(f'📊 当前活跃持仓共 {len(active)} 只')
 
     # 9. 控制台输出 TOP 5
     print('\n' + '=' * 60)
