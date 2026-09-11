@@ -10,6 +10,7 @@
 5. 输出 TOP 5 + 警示名单
 6. 保存完整报告
 7. 推钉钉群
+8. 持仓池补位（模拟盘，上限 3 只；盈利 +15% 后走移动止盈，峰后回撤 5% 卖出）
 
 推送通道：自定义 webhook 机器人（钉钉群 → 您的手机）
 """
@@ -32,7 +33,7 @@ from src.data_fetcher import (
 from src.selector import screen_stocks, fallback_from_top_gainers
 from src.report import generate_dingtalk_payload, save_full_report
 from src.dingtalk import push_to_dingtalk
-from src.portfolio import add_top3_from_screening, get_active_holdings
+from src.portfolio import fill_portfolio_from_candidates, get_active_holdings, MAX_HOLDINGS
 
 
 # 日志配置
