@@ -16,14 +16,21 @@
 - 触发线：trail_high × (1 - trail_drawdown_pct/100)，默认回撤 8%
 - 判定：盘中最低价 ≤ 触发线 → 视为触发，成交价＝触发线（贴近真实移动止盈单）
 
-时间止损细则（2026-09-11 新增，2026-09-11 调参为 5/10 快档）：
+时间止损细则（2026-09-11 新增，稳健档 8/15）：
 - 交易日钟 days_held：每遇到一个**新的行情日** +1（同日重复运行不重复计数，天然幂等）
 - 期间最高涨幅 peak_high_pnl：由持有期内的最高价算出（`peak_high`，只上不下）
-- 🧟 僵尸股：持有 ≥ ZOMBIE_DAYS(5) 交易日 且 期间最高涨幅 < ZOMBIE_PEAK_PCT(3%)  → 清理
-- 🐌 低效股：持有 ≥ INEFFICIENT_DAYS(10) 交易日 且 未启动移动止盈 且 期间最高涨幅 < 5% → 清理
+- 🧟 僵尸股：持有 ≥ ZOMBIE_DAYS(8) 交易日 且 期间最高涨幅 < ZOMBIE_PEAK_PCT(3%)  → 清理
+- 🐌 低效股：持有 ≥ INEFFICIENT_DAYS(15) 交易日 且 未启动移动止盈 且 期间最高涨幅 < 5% → 清理
 - 🔒 已启动移动止盈的持仓**永久豁免**时间止损（趋势已确认，交给移动止盈）
 
-触发优先级：**止损 > 移动止盈 > 时间止损 > 接近启动线提醒**
+大盘弱势熔断（2026-09-11 新增）：
+- 触发：上证指数当日跌幅 ≤ MARKET_FUSE_DROP_PCT(-2.0%)
+- 作用：**当天暂停时间止损**（僵尸/低效清理属"主动换仓"，暴跌日不做卖出决策，
+  避免在系统性下跌里被批量扫出去、卖在最低点；次日大盘企稳即自动补执行）
+- 不影响：固定止损 -7%、移动止盈**照常执行** —— 那是保护性纪律，不因大盘弱而放宽
+- 数据缺失（指数涨跌幅为 None/NaN）→ **不熔断**，避免因取数失败导致长期停摆
+
+触发优先级：**止损 > 移动止盈 > 时间止损（大盘熔断时可被拦下）> 接近启动线提醒**
 
 数据模型（version 2）：
 {
@@ -56,9 +63,30 @@
 }
 """
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Any
+
+# ============= 环境变量覆盖（应急调整 / 云端验证用）=============
+def _env_float(name: str, default: float) -> float:
+    """用环境变量覆盖数值参数（空值 / 非法值 → 回退默认值）"""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """用环境变量覆盖布尔开关（1/true/yes/on → True）"""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
 
 # ============= 路径配置 =============
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -79,10 +107,22 @@ MAX_CLOSED_KEEP = 30             # 仅保留最近 N 条已平仓记录，防止
 # 判定口径统一用「期间最高涨幅 peak_high_pnl」（持有期内最高价，只上不下），
 # 比看当前盈亏公平：单日大盘普跌不会把本来形态不错的票误杀。
 TIME_STOP_ENABLED = True         # 时间止损总开关
-ZOMBIE_DAYS = 5                  # 🧟 僵尸股考察期（交易日）——约 1 周
+ZOMBIE_DAYS = 8                  # 🧟 僵尸股考察期（交易日）——约 2 周（稳健档）
 ZOMBIE_PEAK_PCT = 3.0            #    期间最高涨幅低于此值 → 判为僵尸（从没像样动过）
-INEFFICIENT_DAYS = 10            # 🐌 低效股考察期（交易日）——约 2 周
+INEFFICIENT_DAYS = 15            # 🐌 低效股考察期（交易日）——约 3 周（稳健档）
 INEFFICIENT_PEAK_PCT = 5.0       #    期满仍未启动移动止盈且峰值低于此值 → 判为低效
+# 参考档位：激进 3/7 ｜ 快档 5/10 ｜ 当前·稳健 8/15
+
+# ============= 大盘弱势熔断参数（2026-09-11 新增）=============
+# 逻辑：大盘暴跌日不做「主动换仓」——暴跌往往泥沙俱下，此时清理僵尸股很容易卖在最低点，
+#      次日大盘企稳又得重新追高。熔断只拦时间止损，止损/移动止盈照常（那是硬纪律）。
+# 取数：复用 fetch_market_review() 的上证指数涨跌幅（Tushare index_daily）
+MARKET_FUSE_ENABLED = _env_bool('MARKET_FUSE_ENABLED', True)
+MARKET_FUSE_INDEX = '上证指数'    # 判定基准（仅供文案展示）
+MARKET_FUSE_DROP_PCT = _env_float('MARKET_FUSE_DROP_PCT', -2.0)
+MARKET_FUSE_SCOPE = 'time_stop'  # 熔断作用范围：仅时间止损（预留扩展）
+# 以上两个参数支持环境变量覆盖（MARKET_FUSE_ENABLED / MARKET_FUSE_DROP_PCT），
+# 便于应急调整；云端验证时可用极端阈值（如 99）强制触发熔断来验证拦截路径。
 
 STATUS_TEXT = {
     'stop_loss': '🚨 触发止损',
@@ -94,10 +134,18 @@ STATUS_TEXT = {
     'no_quote': '❓ 无行情',
     'time_stop_zombie': '🧟 僵尸股清理',
     'time_stop_inefficient': '🐌 低效股清理',
+    'time_stop_zombie_fused': '🧟 僵尸股清理·熔断暂缓',
+    'time_stop_inefficient_fused': '🐌 低效股清理·熔断暂缓',
 }
 
 # 时间止损平仓原因（供上层判断/渲染）
 TIME_STOP_REASONS = ('time_stop_zombie', 'time_stop_inefficient')
+
+# 熔断暂缓对应的状态键（reason → fused 状态文案）
+FUSE_STATUS_KEY = {
+    'time_stop_zombie': 'time_stop_zombie_fused',
+    'time_stop_inefficient': 'time_stop_inefficient_fused',
+}
 
 
 # ============= 内部工具 =============
@@ -276,6 +324,55 @@ def _hold_days(holding: Dict) -> Optional[int]:
     except (ValueError, TypeError):
         return None
     return max(0, int((datetime.now() - d0).days * 5 / 7))
+
+
+def market_fuse_check(index_pct_change: Optional[float],
+                      enabled: Optional[bool] = None,
+                      drop_pct: Optional[float] = None):
+    """
+    大盘弱势熔断判定（只拦「时间止损」这类主动换仓动作，不拦止损/移动止盈）。
+
+    - index_pct_change：基准指数当日涨跌幅（%），来自 fetch_market_review()['index_pct_change']
+    - None / NaN / 非法值 → **不熔断**（取数失败时不阻塞正常流程，宁可照常执行时间止损）
+    - 返回 (是否熔断, 说明文案)
+
+    例：上证指数 -2.35% 且阈值 -2.0% → (True, '上证指数 -2.35%（≤-2.0%）→ 今日暂停时间止损…')
+    """
+    if enabled is None:
+        enabled = MARKET_FUSE_ENABLED
+    if drop_pct is None:
+        drop_pct = MARKET_FUSE_DROP_PCT
+    if not enabled:
+        return False, ''
+    if index_pct_change is None:
+        return False, ''
+    try:
+        pct = float(index_pct_change)
+    except (TypeError, ValueError):
+        return False, ''
+    if pct != pct:          # NaN 自比不相等
+        return False, ''
+    if pct <= drop_pct:
+        return True, (f'{MARKET_FUSE_INDEX} {pct:+.2f}%（≤{drop_pct:.1f}%）'
+                      f' → 今日暂停时间止损，持仓不动，大盘企稳后自动补执行')
+    return False, ''
+
+
+def mark_fused(evaluation: Dict, fuse_msg: str = '') -> Dict:
+    """
+    把「已被时间止损判定命中、但因大盘熔断暂缓执行」的评估结果就地打标（返回同一对象）。
+
+    - 加 `fused=True` / `fuse_reason`
+    - 状态文案改为 `🧟 僵尸股清理·熔断暂缓`，避免报告里看起来像已经清仓
+    """
+    reason = evaluation.get('trigger')
+    if reason in TIME_STOP_REASONS:
+        evaluation['fused'] = True
+        evaluation['fuse_reason'] = fuse_msg
+        key = FUSE_STATUS_KEY.get(reason)
+        if key:
+            evaluation['status_text'] = STATUS_TEXT[key]
+    return evaluation
 
 
 def _time_stop_check(days_held: int, peak_high_pnl: Optional[float]) -> Optional[str]:
