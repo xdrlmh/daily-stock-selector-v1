@@ -127,12 +127,13 @@ def main():
         else:
             log.error(f'❌ 钉钉推送失败：{msg}')
 
-    # 8.5 自动写入持仓池（TOP 3 监控）
+    # 8.5 自动补仓（持仓上限 MAX_HOLDINGS 只，按评分顺序补齐空仓位）
     if not top_picks.empty:
-        added = add_top3_from_screening(top_picks)
-        log.info(f'🛒 持仓池新增 {added} 只（TOP 3）')
+        added = fill_portfolio_from_candidates(top_picks, source='morning_screen')
+        log.info(f'🛒 持仓池新增 {len(added)} 只（上限 {MAX_HOLDINGS} 只）')
         active = get_active_holdings()
-        log.info(f'📊 当前活跃持仓共 {len(active)} 只')
+        log.info(f'📊 当前活跃持仓 {len(active)}/{MAX_HOLDINGS} 只：'
+                 f"{['%s(%s)' % (h['name'], h['code']) for h in active]}")
 
     # 9. 控制台输出 TOP 5
     print('\n' + '=' * 60)
