@@ -4,8 +4,17 @@
 设计要点：
 1. 最多同时持有 MAX_HOLDINGS(3) 只；
 2. 买入价按「信号日次日开盘价」归一化（贴近模拟盘真实买入成本）；
-3. 止盈/止损平仓后自动补仓（由盘后复盘流程调用，详见 main_review.py）；
-4. 持仓池持久化到 data/portfolio.json（GitHub Actions 中由 workflow 回写仓库）。
+3. 止盈＝**移动止盈**：盈利首次达到 +15% 后启动，随后跟踪启动以来的最高价，
+   从最高价回撤 5% 即卖出（保护利润，同时不切断主升浪）；
+4. 平仓后自动补仓（由盘后复盘流程调用，详见 main_review.py）；
+5. 持仓池持久化到 data/portfolio.json（GitHub Actions 中由 workflow 回写仓库）。
+
+移动止盈细则：
+- 启动线：盈利 ≥ trail_activate_pct（默认 +15%）
+- 峰值 trail_high：取「盘中最高价」与收盘价中的较大者，逐日抬升（只上不下）
+- 触发线：trail_high × (1 - trail_drawdown_pct/100)，默认回撤 5%
+- 判定：盘中最低价 ≤ 触发线 → 视为触发，成交价＝触发线（贴近真实移动止盈单）
+- 止损优先：收盘盈亏 ≤ stop_loss_pct（默认 -7%）时直接止损，不再看移动止盈
 
 数据模型（version 2）：
 {
@@ -14,17 +23,21 @@
   "holdings": [
     {
       "code": "601975", "name": "招商南油",
-      "buy_price": 4.48,          # entry_pending=true 时为信号日收盘价
-      "buy_date": "2026-09-12",   # 信号日
-      "entry_date": null,         # 实际建仓日（=信号次日，归一化后写入）
-      "entry_pending": true,      # true=等待次日开盘价归一化
+      "buy_price": 4.48,               # entry_pending=true 时为信号日收盘价
+      "buy_date": "2026-09-12",        # 信号日
+      "entry_date": null,              # 实际建仓日（=信号次日，归一化后写入）
+      "entry_pending": true,           # true=等待次日开盘价归一化
       "shares": 0,
-      "stop_loss_pct": -7.0,
-      "take_profit_pct": 15.0,
+      "stop_loss_pct": -7.0,           # 固定止损
+      "trail_activate_pct": 15.0,      # 移动止盈启动线
+      "trail_drawdown_pct": 5.0,       # 启动后回撤卖出幅度
+      "trail_active": false,           # 移动止盈是否已启动
+      "trail_high": null,              # 启动以来的最高价（只上不下）
       "alerted": false, "alerted_at": null,
       "closed": false, "closed_at": null,
       "closed_price": null, "closed_pnl": null, "close_reason": null,
-      "source": "morning_screen"  # morning_screen | review_refill
+      "closed_peak_pnl": null,         # 平仓时的峰值盈亏（复盘展示用）
+      "source": "morning_screen"       # morning_screen | review_refill
     }
   ]
 }
@@ -40,23 +53,42 @@ DATA_DIR = PROJECT_ROOT / 'data'
 PORTFOLIO_PATH = DATA_DIR / 'portfolio.json'
 
 # ============= 持仓参数 =============
-DEFAULT_STOP_LOSS_PCT = -7.0     # 默认止损 -7%
-DEFAULT_TAKE_PROFIT_PCT = 15.0   # 默认止盈 +15%
-WARNING_PROFIT_PCT = 10.0        # 接近止盈的提醒阈值
+DEFAULT_STOP_LOSS_PCT = -7.0     # 固定止损 -7%
+TRAIL_ACTIVATE_PCT = 15.0        # 盈利达到 +15% 启动移动止盈
+TRAIL_DRAWDOWN_PCT = 5.0         # 启动后从最高价回撤 5% → 卖出
+WARNING_PROFIT_PCT = 10.0        # 接近启动线的提醒阈值
+DEFAULT_TAKE_PROFIT_PCT = TRAIL_ACTIVATE_PCT   # 兼容旧字段/旧调用（含义＝启动线）
 MAX_HOLDINGS = 3                 # 最大同时持仓数（模拟盘买进头 3 只）
 MAX_CLOSED_KEEP = 30             # 仅保留最近 N 条已平仓记录，防止文件无限膨胀
 
 STATUS_TEXT = {
     'stop_loss': '🚨 触发止损',
-    'take_profit': '🎯 触发止盈',
-    'warning': '⚡ 接近止盈',
+    'take_profit': '🔒 移动止盈卖出',
+    'trailing': '🔒 移动止盈中',
+    'warning': '⚡ 接近启动线',
     'normal': '🟢 正常持有',
     'pending': '⏳ 待开盘价',
     'no_quote': '❓ 无行情',
 }
 
 
-# ============= 基础读写 =============
+# ============= 内部工具 =============
+def _to_float(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pnl_pct(price: float, buy: float) -> float:
+    """价格相对买入价的盈亏百分比（保留 2 位，规避浮点误差如 11.5/10→14.9999…）"""
+    if buy <= 0:
+        return 0.0
+    return round((price / buy - 1) * 100, 2)
+
+
 def _ensure_data_dir():
     DATA_DIR.mkdir(exist_ok=True)
 
@@ -69,6 +101,22 @@ def _empty_portfolio() -> Dict:
     }
 
 
+def _migrate(portfolio: Dict) -> Dict:
+    """老版本持仓补齐移动止盈字段（幂等）"""
+    for h in portfolio.get('holdings', []):
+        h.setdefault('stop_loss_pct', DEFAULT_STOP_LOSS_PCT)
+        if 'trail_activate_pct' not in h:
+            h['trail_activate_pct'] = _to_float(h.get('take_profit_pct')) or TRAIL_ACTIVATE_PCT
+        h.setdefault('trail_drawdown_pct', TRAIL_DRAWDOWN_PCT)
+        h.setdefault('trail_active', False)
+        h.setdefault('trail_high', None)
+        h.setdefault('closed_peak_pnl', None)
+        # 兼容旧读者：take_profit_pct 始终＝启动线
+        h['take_profit_pct'] = h['trail_activate_pct']
+    return portfolio
+
+
+# ============= 基础读写 =============
 def load_portfolio() -> Dict:
     """加载持仓池；文件不存在或损坏时返回空持仓池"""
     _ensure_data_dir()
@@ -79,7 +127,7 @@ def load_portfolio() -> Dict:
             data = json.load(f)
         if not isinstance(data, dict) or 'holdings' not in data:
             return _empty_portfolio()
-        return data
+        return _migrate(data)
     except (json.JSONDecodeError, IOError) as e:
         print(f'⚠️ 读取持仓池失败: {e}，返回空持仓池')
         return _empty_portfolio()
@@ -176,43 +224,165 @@ def _hold_days(holding: Dict) -> Optional[int]:
         return None
 
 
-def evaluate_holding(holding: Dict, current_price: float) -> Optional[Dict]:
+def evaluate_holding(holding: Dict, current_price: float,
+                     day_high: Optional[float] = None,
+                     day_low: Optional[float] = None) -> Optional[Dict]:
     """
     评估单只持仓（纯计算，不落盘）。
 
     触发规则：
-    - 止损：盈亏 ≤ stop_loss_pct（默认 -7%）
-    - 止盈：盈亏 ≥ take_profit_pct（默认 +15%）
-    - 警戒：盈亏 ≥ WARNING_PROFIT_PCT（默认 +10%），且尚未提醒过
+    - 止损：收盘盈亏 ≤ stop_loss_pct（默认 -7%）——优先级最高
+    - 移动止盈：
+        1) 盈利（按盘中最高价）首次 ≥ trail_activate_pct（默认 +15%）→ 启动
+        2) 启动后 trail_high 取「盘中最高价 / 收盘价」的最大值（只上不下）
+        3) 触发线 = trail_high × (1 - trail_drawdown_pct/100)
+        4) 盘中最低价 ≤ 触发线 → 卖出，成交价＝触发线
+    - 警戒：盈利 ≥ WARNING_PROFIT_PCT（默认 +10%）且尚未启动，一次性提醒
+
+    day_high / day_low：当日盘中最高/最低价（缺省时退化为用收盘价判断）
+
+    返回 dict；无有效行情时返回 None。
+    额外返回（供调用方落盘）：
+      trail_active / trail_high / trail_started（本次是否新启动）
+      exit_price / exit_pnl_pct（触发卖出时的成交价与盈亏）
     """
-    buy = float(holding.get('buy_price') or 0)
-    if buy <= 0 or current_price is None or float(current_price) <= 0:
+    buy = _to_float(holding.get('buy_price'))
+    if buy <= 0 or current_price is None or _to_float(current_price) <= 0:
         return None
 
-    current_price = float(current_price)
-    pnl_pct = round((current_price / buy - 1) * 100, 2)
-    stop = float(holding.get('stop_loss_pct', DEFAULT_STOP_LOSS_PCT))
-    take = float(holding.get('take_profit_pct', DEFAULT_TAKE_PROFIT_PCT))
+    current_price = _to_float(current_price)
+    high = _to_float(day_high) or current_price
+    low = _to_float(day_low) or current_price
+    high = max(high, current_price)
+    low = min(low, current_price) if low > 0 else current_price
 
+    pnl_pct = _pnl_pct(current_price, buy)
+    stop = _to_float(holding.get('stop_loss_pct')) or DEFAULT_STOP_LOSS_PCT
+    activate = (_to_float(holding.get('trail_activate_pct'))
+                or _to_float(holding.get('take_profit_pct'))
+                or TRAIL_ACTIVATE_PCT)
+    drawdown = _to_float(holding.get('trail_drawdown_pct')) or TRAIL_DRAWDOWN_PCT
+
+    was_active = bool(holding.get('trail_active'))
+    trail_active = was_active
+    trail_high = _to_float(holding.get('trail_high')) or 0.0
+    trail_started = False
+    exit_price: Optional[float] = None
+    exit_pnl_pct: Optional[float] = None
+
+    # ---- 1) 止损优先 ----
     if pnl_pct <= stop:
         trigger = 'stop_loss'
-    elif pnl_pct >= take:
-        trigger = 'take_profit'
-    elif pnl_pct >= WARNING_PROFIT_PCT and not holding.get('alerted'):
-        trigger = 'warning'
+        exit_price = round(current_price, 3)
+        exit_pnl_pct = pnl_pct
+        trail_active = was_active          # 止损不动移动止盈状态
+        trail_high = trail_high or None
+
     else:
-        trigger = 'normal'
+        # ---- 2) 更新峰值 / 判断启动 ----
+        if not trail_active:
+            peak_pnl = _pnl_pct(max(high, current_price), buy)
+            if peak_pnl >= activate:
+                trail_active = True
+                trail_started = True
+                trail_high = max(high, current_price)
+        else:
+            trail_high = max(trail_high, high, current_price)
+
+        if trail_active:
+            trigger_price = round(trail_high * (1 - drawdown / 100), 3)
+            if low <= trigger_price:
+                # 盘中触及回撤线 → 按触发价成交（移动止盈单口径）
+                trigger = 'take_profit'
+                exit_price = trigger_price
+                exit_pnl_pct = _pnl_pct(trigger_price, buy)
+            elif current_price <= trigger_price:
+                # 收盘已跌破触发线（保护性兜底）
+                trigger = 'take_profit'
+                exit_price = round(current_price, 3)
+                exit_pnl_pct = pnl_pct
+            else:
+                trigger = 'trailing'
+        elif pnl_pct >= WARNING_PROFIT_PCT and not holding.get('alerted'):
+            trigger = 'warning'
+        else:
+            trigger = 'normal'
+
+    # ---- 3) 汇总 ----
+    if trail_active and trail_high:
+        trail_trigger_price = round(trail_high * (1 - drawdown / 100), 3)
+        trail_peak_pnl = _pnl_pct(trail_high, buy)
+        distance_to_trail = round((current_price / trail_trigger_price - 1) * 100, 2)
+        distance_to_take_profit = distance_to_trail      # 已启动 → 距回撤线
+    else:
+        trail_trigger_price = None
+        trail_peak_pnl = None
+        distance_to_trail = None
+        distance_to_take_profit = round(activate - pnl_pct, 2)   # 未启动 → 距启动线
 
     return {
         'code': holding['code'],
         'name': holding.get('name', ''),
         'buy_price': round(buy, 3),
+        'buy_date': holding.get('buy_date'),
+        'entry_date': holding.get('entry_date'),
         'current_price': round(current_price, 3),
+        'day_high': round(high, 3),
+        'day_low': round(low, 3),
         'pnl_pct': pnl_pct,
         'trigger': trigger,
         'status_text': STATUS_TEXT.get(trigger, ''),
+        # 止损
+        'stop_loss_pct': stop,
         'distance_to_stop_loss': round(pnl_pct - stop, 2),
-        'distance_to_take_profit': round(take - pnl_pct, 2),
+        # 移动止盈
+        'trail_activate_pct': activate,
+        'trail_drawdown_pct': drawdown,
+        'trail_active': trail_active,
+        'trail_high': round(trail_high, 3) if trail_high else None,
+        'trail_trigger_price': trail_trigger_price,
+        'trail_peak_pnl': trail_peak_pnl,
+        'trail_started': trail_started,
+        'distance_to_trail': distance_to_trail,
+        # 兼容旧字段：未启动＝距启动线；已启动＝距回撤线
+        'distance_to_take_profit': distance_to_take_profit,
+        # 平仓口径
+        'exit_price': exit_price,
+        'exit_pnl_pct': exit_pnl_pct,
+        # 其他
+        'hold_days': _hold_days(holding),
+        'entry_pending': bool(holding.get('entry_pending')),
+    }
+
+
+def make_status_placeholder(holding: Dict, current_price: float = 0.0,
+                            trigger: str = 'no_quote') -> Dict:
+    """生成占位评估结果（无行情 / 待开盘价场景），保证报告字段齐全"""
+    buy = _to_float(holding.get('buy_price'))
+    activate = (_to_float(holding.get('trail_activate_pct'))
+                or _to_float(holding.get('take_profit_pct')) or TRAIL_ACTIVATE_PCT)
+    drawdown = _to_float(holding.get('trail_drawdown_pct')) or TRAIL_DRAWDOWN_PCT
+    trail_high = _to_float(holding.get('trail_high')) or 0.0
+    trail_active = bool(holding.get('trail_active'))
+    return {
+        'code': holding['code'], 'name': holding.get('name', ''),
+        'buy_price': round(buy, 3),
+        'buy_date': holding.get('buy_date'), 'entry_date': holding.get('entry_date'),
+        'current_price': round(_to_float(current_price), 3),
+        'day_high': 0.0, 'day_low': 0.0,
+        'pnl_pct': 0.0, 'trigger': trigger,
+        'status_text': STATUS_TEXT.get(trigger, ''),
+        'stop_loss_pct': _to_float(holding.get('stop_loss_pct')) or DEFAULT_STOP_LOSS_PCT,
+        'distance_to_stop_loss': 0.0,
+        'trail_activate_pct': activate, 'trail_drawdown_pct': drawdown,
+        'trail_active': trail_active,
+        'trail_high': round(trail_high, 3) if trail_high else None,
+        'trail_trigger_price': (round(trail_high * (1 - drawdown / 100), 3) if trail_high else None),
+        'trail_peak_pnl': (round((trail_high / buy - 1) * 100, 2) if trail_high and buy else None),
+        'trail_started': False,
+        'distance_to_trail': None,
+        'distance_to_take_profit': 0.0,
+        'exit_price': None, 'exit_pnl_pct': None,
         'hold_days': _hold_days(holding),
         'entry_pending': bool(holding.get('entry_pending')),
     }
@@ -222,15 +392,20 @@ def evaluate_holding(holding: Dict, current_price: float) -> Optional[Dict]:
 def add_to_portfolio(code: str, name: str, buy_price: float,
                      buy_date: Optional[str] = None,
                      stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
-                     take_profit_pct: float = DEFAULT_TAKE_PROFIT_PCT,
-                     source: str = 'morning_screen') -> Optional[Dict]:
+                     trail_activate_pct: float = TRAIL_ACTIVATE_PCT,
+                     trail_drawdown_pct: float = TRAIL_DRAWDOWN_PCT,
+                     source: str = 'morning_screen',
+                     take_profit_pct: Optional[float] = None) -> Optional[Dict]:
     """
     新增一只持仓。
     - 已存在（任意未平仓）→ 跳过
     - 仓位已满（>= MAX_HOLDINGS）→ 跳过
     - entry_pending=True：buy_price 为信号日收盘价，待次日开盘归一化
+    - take_profit_pct：旧参数名，等价于 trail_activate_pct（向后兼容）
     返回新增的 holding（未新增则 None）
     """
+    if take_profit_pct is not None:
+        trail_activate_pct = take_profit_pct
     code = str(code).zfill(6)
     portfolio = load_portfolio()
     holdings = portfolio.get('holdings', [])
@@ -253,7 +428,11 @@ def add_to_portfolio(code: str, name: str, buy_price: float,
         'entry_pending': True,
         'shares': 0,
         'stop_loss_pct': float(stop_loss_pct),
-        'take_profit_pct': float(take_profit_pct),
+        'trail_activate_pct': float(trail_activate_pct),
+        'trail_drawdown_pct': float(trail_drawdown_pct),
+        'trail_active': False,
+        'trail_high': None,
+        'take_profit_pct': float(trail_activate_pct),   # 兼容旧读者
         'alerted': False,
         'alerted_at': None,
         'closed': False,
@@ -261,12 +440,14 @@ def add_to_portfolio(code: str, name: str, buy_price: float,
         'closed_price': None,
         'closed_pnl': None,
         'close_reason': None,
+        'closed_peak_pnl': None,
         'source': source,
     }
     holdings.append(holding)
     save_portfolio(portfolio)
     print(f'  ➕ 加入持仓池: {name}({code}) 参考价 {buy_price:.2f} '
-          f'止损{stop_loss_pct}% / 止盈{take_profit_pct}%（来源：{source}）')
+          f'止损{stop_loss_pct}% / 移动止盈启动+{trail_activate_pct}%（回撤{trail_drawdown_pct}%）'
+          f'（来源：{source}）')
     return holding
 
 
@@ -332,16 +513,16 @@ def normalize_pending_entries(price_map: Dict[str, Dict], data_date: str) -> Lis
         info = price_map.get(h['code'])
         if not info:
             continue
-        try:
-            open_px = float(info.get('open') or 0)
-        except (TypeError, ValueError):
-            open_px = 0
+        open_px = _to_float(info.get('open'))
         if open_px <= 0:
             continue
         old = h.get('buy_price')
         h['buy_price'] = round(open_px, 3)
         h['entry_pending'] = False
         h['entry_date'] = date_str
+        # 建仓当日重置移动止盈状态（以真实成本为基准重新起算）
+        h['trail_active'] = False
+        h['trail_high'] = None
         changed.append({'code': h['code'], 'name': h.get('name', ''),
                         'old': old, 'new': h['buy_price'], 'entry_date': date_str})
 
@@ -353,8 +534,38 @@ def normalize_pending_entries(price_map: Dict[str, Dict], data_date: str) -> Lis
     return changed
 
 
+def update_trail_states(states: List[Dict]) -> int:
+    """
+    批量落盘移动止盈状态（一次写盘）。
+    states: [{'code': '601975', 'trail_active': True, 'trail_high': 5.12}, ...]
+    返回实际更新的条数。
+    """
+    if not states:
+        return 0
+    portfolio = load_portfolio()
+    by_code = {str(s.get('code')).zfill(6): s for s in states if s.get('code')}
+    updated = 0
+    for h in portfolio.get('holdings', []):
+        if h.get('closed'):
+            continue
+        s = by_code.get(h['code'])
+        if not s:
+            continue
+        new_active = bool(s.get('trail_active'))
+        new_high = s.get('trail_high')
+        new_high = round(_to_float(new_high), 3) if new_high else None
+        if h.get('trail_active') != new_active or h.get('trail_high') != new_high:
+            h['trail_active'] = new_active
+            h['trail_high'] = new_high
+            updated += 1
+    if updated:
+        save_portfolio(portfolio)
+    return updated
+
+
 def close_holding(code: str, pnl_pct: float, reason: str = 'stop_loss',
-                  price: Optional[float] = None) -> Optional[Dict]:
+                  price: Optional[float] = None,
+                  peak_pnl: Optional[float] = None) -> Optional[Dict]:
     """标记某只持仓已止盈/止损出场。返回被平仓的 holding（未找到则 None）"""
     code = str(code).zfill(6)
     portfolio = load_portfolio()
@@ -366,6 +577,8 @@ def close_holding(code: str, pnl_pct: float, reason: str = 'stop_loss',
             h['closed_price'] = round(float(price), 3) if price else None
             h['closed_pnl'] = round(float(pnl_pct), 2)
             h['close_reason'] = reason
+            if peak_pnl is not None:
+                h['closed_peak_pnl'] = round(float(peak_pnl), 2)
             target = h
             break
     if target:
@@ -375,7 +588,7 @@ def close_holding(code: str, pnl_pct: float, reason: str = 'stop_loss',
 
 
 def mark_alerted(code: str) -> None:
-    """标记某只持仓已推送过「接近止盈」提醒（避免重复提醒）"""
+    """标记某只持仓已推送过「接近启动线」提醒（避免重复提醒）"""
     code = str(code).zfill(6)
     portfolio = load_portfolio()
     for h in portfolio.get('holdings', []):
@@ -401,14 +614,18 @@ if __name__ == '__main__':
         print(f'\n📂 当前持仓池（活跃 {len(active)}/{MAX_HOLDINGS}）：')
         for h in active:
             flag = '⏳待归一化' if h.get('entry_pending') else '🟢已建仓'
+            trail = (f"移动止盈中 峰值{h.get('trail_high')}" if h.get('trail_active')
+                     else f"移动止盈待启动(+{h.get('trail_activate_pct')}%)")
             print(f"  {flag} {h['name']}({h['code']}) @ {h['buy_price']} "
-                  f"止损{h['stop_loss_pct']}% / 止盈{h['take_profit_pct']}% 来源={h.get('source')}")
+                  f"止损{h['stop_loss_pct']}% / {trail} 来源={h.get('source')}")
         recent = get_recent_closed_holdings(5)
         if recent:
             print(f'\n📜 最近平仓（{len(recent)} 条）：')
             for h in recent:
+                peak = h.get('closed_peak_pnl')
+                peak_txt = f" 峰值{peak:+.2f}%" if peak is not None else ''
                 print(f"  [{h.get('close_reason')}] {h['name']}({h['code']}) "
-                      f"{h.get('closed_pnl'):+.2f}% @ {h.get('closed_at')}")
+                      f"{h.get('closed_pnl'):+.2f}%{peak_txt} @ {h.get('closed_at')}")
         stats = portfolio_stats()
         if stats['total']:
             print(f"\n📊 累计战绩：{stats['total']} 笔，胜率 {stats['win_rate']}%，"
