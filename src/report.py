@@ -396,7 +396,112 @@ def generate_outlook(market: Dict[str, Any], sector_heat: List[Dict]) -> List[st
 
     # 4) 风险提示
     if main_yi is not None and main_yi < -50:
+        lines.append('')
         lines.append('> ⚠️ 大盘资金面偏弱，建议压缩仓位、精选确定性标的')
+
+    return lines
+
+
+def format_date_cn(date_str: str) -> str:
+    """YYYYMMDD → YYYY-MM-DD；空值返回 '-'"""
+    if not date_str:
+        return '-'
+    s = str(date_str)
+    if len(s) == 8 and s.isdigit():
+        return f'{s[:4]}-{s[4:6]}-{s[6:]}'
+    return s
+
+
+def format_md_date(date_str: str) -> str:
+    """YYYY-MM-DD / YYYYMMDD → MM-DD（用于表格窄列）"""
+    s = format_date_cn(date_str)
+    return s[5:] if len(s) >= 10 else s
+
+
+def generate_holdings_section(holdings_status: List[Dict] = None,
+                              closed_today: List[Dict] = None,
+                              new_positions: List[Dict] = None,
+                              stats: Dict = None,
+                              max_holdings: int = 3,
+                              stop_loss_pct: float = -7.0,
+                              take_profit_pct: float = 15.0) -> List[str]:
+    """
+    生成「模拟盘持仓」markdown 段（买卖监控 / 自动补仓结果）
+
+    - holdings_status：当前活跃持仓的评估结果列表
+    - closed_today：当日触发止盈/止损并已平仓的持仓
+    - new_positions：当日自动补仓的新增持仓
+    - stats：累计战绩（portfolio_stats() 的返回值）
+    """
+    rows = holdings_status or []
+    closed_today = closed_today or []
+    new_positions = new_positions or []
+
+    lines = [f'## 💼 模拟盘持仓（{len(rows)}/{max_holdings}）', '']
+
+    if rows:
+        lines.append('| # | 代码 | 名称 | 买入日 | 买入价 | 现价 | 盈亏 | 距止损 | 距止盈 | 状态 |')
+        lines.append('|---|---|---|---|---|---|---|---|---|---|')
+        for i, r in enumerate(rows, 1):
+            if r.get('entry_pending'):
+                status = '⏳ 待开盘价'
+            else:
+                status = r.get('status_text') or '🟢 正常持有'
+            bdate = format_md_date(r.get('entry_date') or r.get('buy_date'))
+            lines.append(
+                f"| {i} | {r['code']} | {r['name']} | {bdate} | "
+                f"{r['buy_price']:.2f} | {r['current_price']:.2f} | "
+                f"**{r['pnl_pct']:+.2f}%** | "
+                f"{r['distance_to_stop_loss']:+.1f}% | {r['distance_to_take_profit']:+.1f}% | {status} |"
+            )
+        lines.append('')
+        lines.append(f'> 💡 买入价＝信号次日开盘价（模拟盘口径）｜止损 {stop_loss_pct}% ／ 止盈 +{take_profit_pct}%')
+        lines.append('')
+
+    # 今日触发（止盈/止损）
+    if closed_today:
+        lines.append('### 🚨 今日触发')
+        lines.append('')
+        for h in closed_today:
+            reason = h.get('close_reason')
+            if reason == 'take_profit':
+                icon, label = '🎯', '达标止盈'
+            elif reason == 'stop_loss':
+                icon, label = '🚨', '触发止损'
+            else:
+                icon, label = '⚠️', '已平仓'
+            pnl = h.get('closed_pnl')
+            pnl_txt = f'{pnl:+.2f}%' if pnl is not None else '-'
+            price_txt = ''
+            if h.get('closed_price'):
+                price_txt = f'（{h.get("buy_price"):.2f} → {h["closed_price"]:.2f}）'
+            lines.append(f'- {icon} **{h.get("name")}({h.get("code")})** {label} **{pnl_txt}**{price_txt} → 已平仓')
+        lines.append('')
+
+    # 今日补仓
+    if new_positions:
+        lines.append('### 🛒 今日补仓（自动补位）')
+        lines.append('')
+        for h in new_positions:
+            lines.append(
+                f'- ➕ **{h.get("name")}({h.get("code")})** 参考价 {h.get("buy_price"):.2f} 元'
+                f'（次日开盘价成交）'
+            )
+        lines.append('')
+
+    # 累计战绩
+    if stats and stats.get('total'):
+        lines.append('### 📈 累计战绩')
+        lines.append('')
+        lines.append(
+            f"- 已平仓 **{stats['total']}** 笔 ｜ 胜率 **{stats['win_rate']}%** "
+            f"｜ 平均收益 **{stats['avg_pnl']:+.2f}%**"
+        )
+        lines.append('')
+
+    if not rows and not closed_today and not new_positions:
+        lines.append('> 📭 当前空仓，等待下一次选股/补仓。')
+        lines.append('')
 
     return lines
 
@@ -404,11 +509,17 @@ def generate_outlook(market: Dict[str, Any], sector_heat: List[Dict]) -> List[st
 def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
                             warnings: pd.DataFrame, all_stocks: pd.DataFrame,
                             market: Dict[str, Any] = None,
-                            sector_heat: List[Dict] = None) -> Dict:
+                            sector_heat: List[Dict] = None,
+                            holdings_status: List[Dict] = None,
+                            closed_today: List[Dict] = None,
+                            new_positions: List[Dict] = None,
+                            stats: Dict = None,
+                            data_date: str = None) -> Dict:
     """
-    生成「主升浪盘后复盘」钉钉消息 payload（15:30 推送）
+    生成「主升浪盘后复盘」钉钉消息 payload（18:30 推送）
     核心模块：
     - 大盘复盘（指数/主力/趋势/成交额/市场情绪）
+    - 💼 模拟盘持仓（止盈止损结算 + 自动补仓结果）—— 已合并原「持仓监控」
     - 今日强势股 TOP5（收盘后五维评分重筛）
     - 板块温度 TOP3（按题材聚合力强板块）
     - 明日展望
@@ -417,7 +528,8 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
     lines.append(f'# 📊 主升浪盘后复盘 {date_str}')
     lines.append('')
     lines.append(f'> 📡 数据源：Tushare')
-    lines.append(f'> 🕐 生成时间：{datetime.now().strftime("%H:%M")} · 视角：当日复盘')
+    lines.append(f'> 📅 数据日期：{format_date_cn(data_date) if data_date else date_str}')
+    lines.append(f'> 🕐 生成时间：{datetime.now().strftime("%H:%M")} · 视角：当日复盘 + 持仓结算')
     lines.append('')
 
     # ---- 大盘复盘 ----
@@ -446,6 +558,14 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
         if lu is not None and up is not None:
             lines.append(f'- **市场情绪**：涨停 {lu} ｜ 跌停 {ld or 0} ｜ 涨跌比 {up}:{down}')
         lines.append('')
+
+    # ---- 💼 模拟盘持仓（止盈止损结算 + 自动补仓）----
+    lines.extend(generate_holdings_section(
+        holdings_status=holdings_status,
+        closed_today=closed_today,
+        new_positions=new_positions,
+        stats=stats,
+    ))
 
     # ---- 今日强势股 TOP5（收盘后）----
     lines.append(f'## 📋 今日强势股 TOP {len(top_picks)}（收盘后）')
@@ -630,7 +750,12 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
                        warnings: pd.DataFrame, all_stocks: pd.DataFrame,
                        market: Dict[str, Any] = None,
                        sector_heat: List[Dict] = None,
-                       reports_dir: Path = None) -> str:
+                       reports_dir: Path = None,
+                       holdings_status: List[Dict] = None,
+                       closed_today: List[Dict] = None,
+                       new_positions: List[Dict] = None,
+                       stats: Dict = None,
+                       data_date: str = None) -> str:
     """
     生成完整版盘后复盘 Markdown 报告（保存到 reports/ 目录做历史记录）
     """
@@ -639,7 +764,8 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
     lines = []
     lines.append(f'# 📊 主升浪盘后复盘 {date_str}')
     lines.append('')
-    lines.append(f'> 数据时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} · 数据源：Tushare')
+    lines.append(f'> 生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} · 数据源：Tushare')
+    lines.append(f'> 数据日期：{format_date_cn(data_date) if data_date else date_str}')
     lines.append('')
 
     # 大盘复盘
@@ -657,6 +783,14 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
         if lu is not None and up is not None:
             lines.append(f'- **市场情绪**：涨停 {lu} ｜ 跌停 {ld or 0} ｜ 涨跌比 {up}:{down}')
         lines.append('')
+
+    # 💼 模拟盘持仓（止盈止损结算 + 自动补仓）
+    lines.extend(generate_holdings_section(
+        holdings_status=holdings_status,
+        closed_today=closed_today,
+        new_positions=new_positions,
+        stats=stats,
+    ))
 
     # 今日强势股 TOP5
     lines.append(f'## 📋 今日强势股 TOP {len(top_picks)}（收盘后）')
