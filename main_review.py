@@ -7,7 +7,9 @@
 2. 抓取大盘复盘数据（指数/主力/趋势/成交额/涨停跌停）
 3. 💼 模拟盘持仓结算（原「持仓止盈止损监控」已合并到此）：
    - 待入场持仓按「当日开盘价」归一化买入成本
-   - 按当日收盘价评估盈亏 → 触发止盈/止损则平仓
+   - 止损：收盘盈亏 ≤ -7%
+   - 移动止盈：盈利首次 ≥ +15% 启动，跟踪启动以来最高价，回撤 5% 即卖出
+     （峰值用盘中最高价更新，触发用盘中最低价判定）
    - 平仓后自动补仓（用当日强势股 TOP 补齐，最多 3 只）
 4. 今日强势股 TOP5（五维评分，收盘后数据）
 5. 板块温度 TOP3（按题材聚合力强板块）
@@ -35,10 +37,11 @@ from src.selector import screen_stocks, analyze_sector_heat
 from src.report import generate_review_payload, save_review_report
 from src.dingtalk import push_to_dingtalk
 from src.portfolio import (
-    MAX_HOLDINGS, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
+    MAX_HOLDINGS, DEFAULT_STOP_LOSS_PCT,
+    TRAIL_ACTIVATE_PCT, TRAIL_DRAWDOWN_PCT,
     get_active_holdings, evaluate_holding, close_holding, mark_alerted,
     normalize_pending_entries, fill_portfolio_from_candidates,
-    portfolio_stats,
+    update_trail_states, make_status_placeholder, portfolio_stats,
 )
 
 logging.basicConfig(
@@ -49,18 +52,28 @@ logging.basicConfig(
 log = logging.getLogger('market-review')
 
 
+def _num(value) -> float:
+    """安全转 float（NaN/None → 0.0）"""
+    try:
+        if value is None or pd.isna(value):
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def build_price_map(spot_df: pd.DataFrame) -> dict:
-    """从全市场行情构建 {code: {'open': 开盘价, 'price': 收盘价}}"""
+    """从全市场行情构建 {code: {'open': 开盘价, 'price': 收盘价, 'high': 最高, 'low': 最低}}"""
     price_map = {}
     if spot_df is None or spot_df.empty:
         return price_map
     for _, row in spot_df.iterrows():
         code = str(row['code']).zfill(6)
-        open_px = row.get('open')
-        close_px = row.get('price')
         price_map[code] = {
-            'open': float(open_px) if pd.notna(open_px) else 0.0,
-            'price': float(close_px) if pd.notna(close_px) else 0.0,
+            'open': _num(row.get('open')),
+            'price': _num(row.get('price')),
+            'high': _num(row.get('high')),
+            'low': _num(row.get('low')),
         }
     return price_map
 
@@ -69,18 +82,19 @@ def settle_holdings(price_map: dict, data_date: str):
     """
     持仓结算（合并自原持仓监控）：
     1. 待入场持仓按当日开盘价归一化买入成本；
-    2. 按当日收盘价评估盈亏，触发止盈/止损则平仓；
-    3. 「接近止盈」标记已提醒，避免重复。
+    2. 止损：收盘盈亏 ≤ -7%；移动止盈：盈利 ≥ +15% 启动，峰值回撤 5% 卖出；
+    3. 「接近启动线」标记已提醒，避免重复提醒。
 
-    返回 (holdings_status, closed_today, price_changes)
+    返回 (holdings_status, closed_today, price_changes, trail_started)
     """
     # 1) 归一化待入场价（信号日收盘价 → 实际建仓日开盘价）
     price_changes = normalize_pending_entries(price_map, data_date)
 
     holdings = get_active_holdings()
-    holdings_status, closed_today = [], []
+    holdings_status, closed_today, trail_started = [], [], []
+    trail_updates = []
     if not holdings:
-        return holdings_status, closed_today, price_changes
+        return holdings_status, closed_today, price_changes, trail_started
 
     print(f'💼 持仓结算：共 {len(holdings)} 只活跃持仓')
     for h in holdings:
@@ -89,45 +103,54 @@ def settle_holdings(price_map: dict, data_date: str):
 
         # 尚无有效行情 → 占位展示
         if not info or cur <= 0:
-            holdings_status.append({
-                'code': h['code'], 'name': h.get('name', ''),
-                'buy_price': float(h.get('buy_price') or 0), 'current_price': 0.0,
-                'pnl_pct': 0.0, 'trigger': 'no_quote', 'status_text': '❓ 无行情',
-                'distance_to_stop_loss': 0.0, 'distance_to_take_profit': 0.0,
-                'hold_days': None, 'entry_pending': bool(h.get('entry_pending')),
-            })
+            holdings_status.append(make_status_placeholder(h, 0.0, 'no_quote'))
             continue
 
         # 待归一化的新仓：不计盈亏（实际建仓在次日开盘）
         if h.get('entry_pending'):
-            holdings_status.append({
-                'code': h['code'], 'name': h.get('name', ''),
-                'buy_price': float(h.get('buy_price') or 0), 'current_price': cur,
-                'pnl_pct': 0.0, 'trigger': 'pending', 'status_text': '⏳ 待开盘价',
-                'distance_to_stop_loss': 0.0, 'distance_to_take_profit': 0.0,
-                'hold_days': None, 'entry_pending': True,
-            })
+            holdings_status.append(make_status_placeholder(h, cur, 'pending'))
             continue
 
-        ev = evaluate_holding(h, cur)
+        ev = evaluate_holding(h, cur, day_high=info.get('high'), day_low=info.get('low'))
         if ev is None:
             continue
 
+        # 移动止盈状态落盘（新启动 / 峰值抬升）
+        trail_updates.append({'code': h['code'],
+                              'trail_active': ev['trail_active'],
+                              'trail_high': ev['trail_high']})
+        if ev['trail_started']:
+            trail_started.append(ev)
+            print(f"  🔒 {h['name']}({h['code']}) 启动移动止盈 "
+                  f"（峰值 {ev['trail_high']:.2f} / {ev['trail_peak_pnl']:+.2f}%，"
+                  f"回撤线 {ev['trail_trigger_price']:.2f}）")
+
         if ev['trigger'] in ('stop_loss', 'take_profit'):
-            closed = close_holding(h['code'], ev['pnl_pct'],
-                                   reason=ev['trigger'], price=cur)
+            reason = ev['trigger']
+            closed = close_holding(h['code'], ev['exit_pnl_pct'], reason=reason,
+                                   price=ev['exit_price'], peak_pnl=ev['trail_peak_pnl'])
             if closed:
                 closed_today.append(closed)
-                print(f"  {'🎯' if ev['trigger'] == 'take_profit' else '🚨'} "
-                      f"{h['name']}({h['code']}) {ev['trigger']} {ev['pnl_pct']:+.2f}% → 已平仓")
+                if reason == 'take_profit':
+                    print(f"  🔒 {h['name']}({h['code']}) 移动止盈卖出 "
+                          f"{ev['exit_pnl_pct']:+.2f}%（峰值 {ev['trail_peak_pnl']:+.2f}% "
+                          f"→ 回撤至 {ev['exit_price']:.2f}）")
+                else:
+                    print(f"  🚨 {h['name']}({h['code']}) 触发止损 "
+                          f"{ev['exit_pnl_pct']:+.2f}% → 已平仓")
             continue  # 已平仓，不再计入活跃持仓表
 
         holdings_status.append(ev)
         if ev['trigger'] == 'warning':
             mark_alerted(h['code'])
-            print(f"  ⚡ {h['name']}({h['code']}) 接近止盈 {ev['pnl_pct']:+.2f}%（已提醒）")
+            print(f"  ⚡ {h['name']}({h['code']}) 接近启动线 {ev['pnl_pct']:+.2f}%（已提醒）")
 
-    return holdings_status, closed_today, price_changes
+    # 批量落盘移动止盈状态（一次写盘）
+    n = update_trail_states(trail_updates)
+    if n:
+        print(f'  💾 移动止盈状态已更新 {n} 只')
+
+    return holdings_status, closed_today, price_changes, trail_started
 
 
 def main():
@@ -176,8 +199,9 @@ def main():
 
     # 7. 💼 持仓结算 + 自动补仓（原持仓监控已合并于此）
     price_map = build_price_map(spot_df)
-    holdings_status, closed_today, price_changes = settle_holdings(price_map, data_date)
-    log.info(f'持仓结算完成：活跃 {len(holdings_status)} 只 / 今日平仓 {len(closed_today)} 只')
+    holdings_status, closed_today, price_changes, trail_started = settle_holdings(price_map, data_date)
+    log.info(f'持仓结算完成：活跃 {len(holdings_status)} 只 / 今日平仓 {len(closed_today)} 只 / '
+             f'新启动移动止盈 {len(trail_started)} 只')
 
     # 7.1 补仓：用当日强势股 TOP 补齐空仓位（不含当日刚平仓的票，避免同日回补）
     exclude_codes = [h['code'] for h in closed_today]
@@ -209,6 +233,7 @@ def main():
         holdings_status=holdings_status,
         closed_today=closed_today,
         new_positions=new_positions,
+        trail_started=trail_started,
         stats=stats,
         data_date=data_date,
     )
@@ -225,6 +250,7 @@ def main():
         holdings_status=holdings_status,
         closed_today=closed_today,
         new_positions=new_positions,
+        trail_started=trail_started,
         stats=stats,
         data_date=data_date,
     )
@@ -246,17 +272,29 @@ def main():
 
     # 11. 控制台小结
     print('\n' + '=' * 60)
-    print(f'💼 持仓（上限 {MAX_HOLDINGS} 只）｜ 止损 {DEFAULT_STOP_LOSS_PCT}% / 止盈 +{DEFAULT_TAKE_PROFIT_PCT}%')
+    print(f'💼 持仓（上限 {MAX_HOLDINGS} 只）｜ 止损 {DEFAULT_STOP_LOSS_PCT}% ｜ '
+          f'移动止盈：+{TRAIL_ACTIVATE_PCT}% 启动 / 回撤 {TRAIL_DRAWDOWN_PCT}% 卖出')
     print('=' * 60)
     for i, r in enumerate(holdings_status, 1):
         flag = '⏳待开盘价' if r.get('entry_pending') else r.get('status_text', '')
+        peak = (f" 峰值{r['trail_high']:.2f}({r['trail_peak_pnl']:+.1f}%)/回撤线{r['trail_trigger_price']:.2f}"
+                if r.get('trail_active') and r.get('trail_high') else '')
         print(f"  {i}. {r['name']}({r['code']}) {r['buy_price']:.2f} → {r['current_price']:.2f} "
-              f"{r['pnl_pct']:+.2f}%  {flag}")
+              f"{r['pnl_pct']:+.2f}%  {flag}{peak}")
+    if trail_started:
+        print(f'\n🔒 今日启动移动止盈 {len(trail_started)} 只：')
+        for r in trail_started:
+            print(f"  🔒 {r['name']}({r['code']}) 峰值 {r['trail_high']:.2f}"
+                  f"（{r['trail_peak_pnl']:+.2f}%）→ 回撤线 {r['trail_trigger_price']:.2f}")
     if closed_today:
         print(f'\n🚨 今日平仓 {len(closed_today)} 只：')
         for h in closed_today:
-            print(f"  [{h.get('close_reason')}] {h['name']}({h['code']}) "
-                  f"{h.get('closed_pnl'):+.2f}% @ {h.get('closed_price')}")
+            reason = h.get('close_reason')
+            label = '移动止盈' if reason == 'take_profit' else ('止损' if reason == 'stop_loss' else reason)
+            peak = h.get('closed_peak_pnl')
+            peak_txt = f"（峰值{peak:+.2f}%）" if peak is not None else ''
+            print(f"  [{label}] {h['name']}({h['code']}) "
+                  f"{h.get('closed_pnl'):+.2f}%{peak_txt} @ {h.get('closed_price')}")
     if new_positions:
         print(f'\n🛒 今日补仓 {len(new_positions)} 只：')
         for h in new_positions:
