@@ -22,6 +22,9 @@ try:
         ZOMBIE_PEAK_PCT as _ZOMBIE_PEAK_PCT,
         INEFFICIENT_DAYS as _INEFFICIENT_DAYS,
         INEFFICIENT_PEAK_PCT as _INEFFICIENT_PEAK_PCT,
+        MARKET_FUSE_ENABLED as _MARKET_FUSE_ENABLED,
+        MARKET_FUSE_INDEX as _MARKET_FUSE_INDEX,
+        MARKET_FUSE_DROP_PCT as _MARKET_FUSE_DROP_PCT,
     )
 except ImportError:  # 兼容以顶层模块方式导入
     from portfolio import (
@@ -34,6 +37,9 @@ except ImportError:  # 兼容以顶层模块方式导入
         ZOMBIE_PEAK_PCT as _ZOMBIE_PEAK_PCT,
         INEFFICIENT_DAYS as _INEFFICIENT_DAYS,
         INEFFICIENT_PEAK_PCT as _INEFFICIENT_PEAK_PCT,
+        MARKET_FUSE_ENABLED as _MARKET_FUSE_ENABLED,
+        MARKET_FUSE_INDEX as _MARKET_FUSE_INDEX,
+        MARKET_FUSE_DROP_PCT as _MARKET_FUSE_DROP_PCT,
     )
 
 
@@ -483,7 +489,10 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                               zombie_days: int = _ZOMBIE_DAYS,
                               zombie_peak_pct: float = _ZOMBIE_PEAK_PCT,
                               inefficient_days: int = _INEFFICIENT_DAYS,
-                              inefficient_peak_pct: float = _INEFFICIENT_PEAK_PCT) -> List[str]:
+                              inefficient_peak_pct: float = _INEFFICIENT_PEAK_PCT,
+                              market_fuse_enabled: bool = _MARKET_FUSE_ENABLED,
+                              market_fuse_index: str = _MARKET_FUSE_INDEX,
+                              market_fuse_drop_pct: float = _MARKET_FUSE_DROP_PCT) -> List[str]:
     """
     生成「模拟盘持仓」markdown 段（移动止盈结算 / 时间止损 / 自动补仓结果）
 
@@ -538,6 +547,9 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
         if time_stop_enabled:
             lines.append(f'> 🧹 时间止损：持有 ≥{zombie_days}日且期间最高涨幅 <{zombie_peak_pct}% → 🧟 僵尸股清理；'
                          f'≥{inefficient_days}日且期间最高 <{inefficient_peak_pct}% → 🐌 低效股清理')
+        if market_fuse_enabled:
+            lines.append(f'> ⚡ 大盘熔断：{market_fuse_index} 单日跌幅 ≤{market_fuse_drop_pct}% → '
+                         f'当天暂停时间止损（止损 / 移动止盈不受影响）')
         lines.append('')
 
     # 今日新启动移动止盈
@@ -605,6 +617,26 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                          f'**{pnl_txt}**{price_txt} → 已清仓')
         lines.append('')
         lines.append('> 🧹 清理腾出的仓位，已由下方「今日补仓」用当日强势股补齐。')
+        lines.append('')
+
+    # ⚡ 大盘弱势熔断：已满足时间止损条件、但当天暂缓执行的持仓
+    fused_rows = [r for r in rows if r.get('fused')]
+    if fused_rows:
+        lines.append('### ⚡ 大盘弱势熔断（暂缓时间止损）')
+        lines.append('')
+        for r in fused_rows:
+            peak = r.get('peak_high_pnl')
+            peak_txt = f'{peak:+.1f}%' if peak is not None else '-'
+            days = r.get('days_held')
+            days_txt = f'{int(days)} 交易日' if days is not None else '-'
+            lines.append(
+                f"- ⚡ **{r.get('name')}({r.get('code')})** 已满足时间止损条件"
+                f"（持有 {days_txt} / 期间最高 {peak_txt}），因大盘弱势**暂缓清理**，持仓保留"
+            )
+        lines.append('')
+        lines.append(f'> 说明：{market_fuse_index} 单日跌幅 ≤ {market_fuse_drop_pct}% 时不做主动换仓'
+                     f'（避免暴跌日卖在最低点），大盘企稳后自动补执行；'
+                     f'同日的止损 / 移动止盈不受影响。')
         lines.append('')
 
     # 今日补仓
