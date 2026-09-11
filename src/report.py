@@ -17,6 +17,11 @@ try:
         DEFAULT_STOP_LOSS_PCT as _STOP_LOSS_PCT,
         TRAIL_ACTIVATE_PCT as _TRAIL_ACTIVATE_PCT,
         TRAIL_DRAWDOWN_PCT as _TRAIL_DRAWDOWN_PCT,
+        TIME_STOP_ENABLED as _TIME_STOP_ENABLED,
+        ZOMBIE_DAYS as _ZOMBIE_DAYS,
+        ZOMBIE_PEAK_PCT as _ZOMBIE_PEAK_PCT,
+        INEFFICIENT_DAYS as _INEFFICIENT_DAYS,
+        INEFFICIENT_PEAK_PCT as _INEFFICIENT_PEAK_PCT,
     )
 except ImportError:  # 兼容以顶层模块方式导入
     from portfolio import (
@@ -24,6 +29,11 @@ except ImportError:  # 兼容以顶层模块方式导入
         DEFAULT_STOP_LOSS_PCT as _STOP_LOSS_PCT,
         TRAIL_ACTIVATE_PCT as _TRAIL_ACTIVATE_PCT,
         TRAIL_DRAWDOWN_PCT as _TRAIL_DRAWDOWN_PCT,
+        TIME_STOP_ENABLED as _TIME_STOP_ENABLED,
+        ZOMBIE_DAYS as _ZOMBIE_DAYS,
+        ZOMBIE_PEAK_PCT as _ZOMBIE_PEAK_PCT,
+        INEFFICIENT_DAYS as _INEFFICIENT_DAYS,
+        INEFFICIENT_PEAK_PCT as _INEFFICIENT_PEAK_PCT,
     )
 
 
@@ -468,12 +478,17 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                               max_holdings: int = _MAX_HOLDINGS,
                               stop_loss_pct: float = _STOP_LOSS_PCT,
                               trail_activate_pct: float = _TRAIL_ACTIVATE_PCT,
-                              trail_drawdown_pct: float = _TRAIL_DRAWDOWN_PCT) -> List[str]:
+                              trail_drawdown_pct: float = _TRAIL_DRAWDOWN_PCT,
+                              time_stop_enabled: bool = _TIME_STOP_ENABLED,
+                              zombie_days: int = _ZOMBIE_DAYS,
+                              zombie_peak_pct: float = _ZOMBIE_PEAK_PCT,
+                              inefficient_days: int = _INEFFICIENT_DAYS,
+                              inefficient_peak_pct: float = _INEFFICIENT_PEAK_PCT) -> List[str]:
     """
-    生成「模拟盘持仓」markdown 段（移动止盈结算 / 自动补仓结果）
+    生成「模拟盘持仓」markdown 段（移动止盈结算 / 时间止损 / 自动补仓结果）
 
     - holdings_status：当前活跃持仓的评估结果列表
-    - closed_today：当日触发止损/移动止盈并已平仓的持仓
+    - closed_today：当日触发止损/移动止盈/时间止损并已平仓的持仓
     - new_positions：当日自动补仓的新增持仓
     - trail_started：当日新启动移动止盈的持仓
     - stats：累计战绩（portfolio_stats() 的返回值）
@@ -486,8 +501,8 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
     lines = [f'## 💼 模拟盘持仓（{len(rows)}/{max_holdings}）', '']
 
     if rows:
-        lines.append('| # | 代码 | 名称 | 买入日 | 买入价 | 现价 | 盈亏 | 距止损 | 距止盈 | 状态 |')
-        lines.append('|---|---|---|---|---|---|---|---|---|---|')
+        lines.append('| # | 代码 | 名称 | 持有 | 买入价 | 现价 | 盈亏 | 峰涨 | 距止损 | 距止盈 | 状态 |')
+        lines.append('|---|---|---|---|---|---|---|---|---|---|---|')
         for i, r in enumerate(rows, 1):
             trail_active = bool(r.get('trail_active'))
             if r.get('entry_pending'):
@@ -495,21 +510,34 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
             elif trail_active and r.get('trail_high'):
                 # 已启动移动止盈 → 状态里带上峰值，一眼看出锁利位置
                 status = f"🔒 移动止盈(峰{r['trail_peak_pnl']:+.0f}%)"
+            elif r.get('trigger') == 'warning':
+                status = r.get('status_text') or '⚡ 接近启动线'
+            elif r.get('time_stop_hint'):
+                # 未启动且「没表现」→ 时间止损观察倒计时
+                status = r['time_stop_hint']
             else:
                 status = r.get('status_text') or '🟢 正常持有'
-            bdate = format_md_date(r.get('entry_date') or r.get('buy_date'))
+            # 持有交易日数
+            days = r.get('days_held')
+            days_txt = f'{int(days)}日' if days is not None else '-'
+            # 期间最高涨幅
+            peak_pnl = r.get('peak_high_pnl')
+            peak_txt = f'{peak_pnl:+.1f}%' if peak_pnl is not None else '-'
             # 距止盈：未启动＝距启动线；已启动＝距回撤触发线
             dist_tp = r.get('distance_to_take_profit')
             dist_txt = f'{dist_tp:+.1f}%' if dist_tp is not None else '-'
             lines.append(
-                f"| {i} | {r['code']} | {r['name']} | {bdate} | "
+                f"| {i} | {r['code']} | {r['name']} | {days_txt} | "
                 f"{r['buy_price']:.2f} | {r['current_price']:.2f} | "
-                f"**{r['pnl_pct']:+.2f}%** | "
+                f"**{r['pnl_pct']:+.2f}%** | {peak_txt} | "
                 f"{r['distance_to_stop_loss']:+.1f}% | {dist_txt} | {status} |"
             )
         lines.append('')
         lines.append(f'> 💡 买入价＝信号次日开盘价（模拟盘口径）｜止损 {stop_loss_pct}% ／ '
                      f'盈利 +{trail_activate_pct}% 启动**移动止盈**（峰值回撤 {trail_drawdown_pct}% 卖出）')
+        if time_stop_enabled:
+            lines.append(f'> 🧹 时间止损：持有 ≥{zombie_days}日且期间最高涨幅 <{zombie_peak_pct}% → 🧟 僵尸股清理；'
+                         f'≥{inefficient_days}日且期间最高 <{inefficient_peak_pct}% → 🐌 低效股清理')
         lines.append('')
 
     # 今日新启动移动止盈
@@ -525,27 +553,58 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
         lines.append(f'> 说明：触发线随峰值上移（只上不下），跌破回撤线即卖出。')
         lines.append('')
 
+    # 按平仓原因拆分：普通出场（移动止盈/止损） vs 时间止损（清理让位）
+    exits = [h for h in closed_today
+             if h.get('close_reason') in ('take_profit', 'stop_loss')]
+    time_stops = [h for h in closed_today
+                  if str(h.get('close_reason') or '').startswith('time_stop')]
+
     # 今日触发（移动止盈 / 止损）
-    if closed_today:
+    if exits:
         lines.append('### 🚨 今日触发')
         lines.append('')
-        for h in closed_today:
+        for h in exits:
             reason = h.get('close_reason')
             peak = h.get('closed_peak_pnl')
             if reason == 'take_profit':
                 icon, label = '🔒', '移动止盈卖出'
                 if peak is not None:
                     label += f'（峰值 {peak:+.1f}%）'
-            elif reason == 'stop_loss':
-                icon, label = '🚨', '触发止损'
             else:
-                icon, label = '⚠️', '已平仓'
+                icon, label = '🚨', '触发止损'
             pnl = h.get('closed_pnl')
             pnl_txt = f'{pnl:+.2f}%' if pnl is not None else '-'
             price_txt = ''
             if h.get('closed_price'):
                 price_txt = f'（{h.get("buy_price"):.2f} → {h["closed_price"]:.2f}）'
             lines.append(f'- {icon} **{h.get("name")}({h.get("code")})** {label} **{pnl_txt}**{price_txt} → 已平仓')
+        lines.append('')
+
+    # 今日时间止损（僵尸股 / 低效股清理 → 腾出仓位给新机会）
+    if time_stops:
+        lines.append('### 🧹 今日时间止损（清理让位）')
+        lines.append('')
+        for h in time_stops:
+            reason = h.get('close_reason')
+            icon = '🧟' if reason == 'time_stop_zombie' else '🐌'
+            label = '僵尸股' if reason == 'time_stop_zombie' else '低效股'
+            peak = h.get('closed_peak_pnl')
+            days = h.get('closed_days_held')
+            detail = []
+            if days is not None:
+                detail.append(f'持有 {days} 交易日')
+            if peak is not None:
+                detail.append(f'期间最高 {peak:+.1f}%')
+            detail_txt = f"（{' / '.join(detail)}）" if detail else ''
+            pnl = h.get('closed_pnl')
+            pnl_txt = f'{pnl:+.2f}%' if pnl is not None else '-'
+            price_txt = ''
+            if h.get('closed_price'):
+                price_txt = f'（{h.get("buy_price"):.2f} → {h["closed_price"]:.2f}）'
+            lines.append(f'- {icon} **{h.get("name")}({h.get("code")})** {label}清理{detail_txt} '
+                         f'**{pnl_txt}**{price_txt} → 已清仓')
+        lines.append('')
+        lines.append('> 🧹 清理腾出的仓位，已由下方「今日补仓」用当日强势股补齐。')
         lines.append('')
 
     # 今日补仓
@@ -567,6 +626,17 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
             f"- 已平仓 **{stats['total']}** 笔 ｜ 胜率 **{stats['win_rate']}%** "
             f"｜ 平均收益 **{stats['avg_pnl']:+.2f}%**"
         )
+        parts = []
+        if stats.get('take_profits'):
+            parts.append(f"🔒 移动止盈 {stats['take_profits']}")
+        if stats.get('stop_losses'):
+            parts.append(f"🚨 止损 {stats['stop_losses']}")
+        if stats.get('time_stops'):
+            parts.append(f"🧹 时间止损 {stats['time_stops']}")
+        if stats.get('avg_days_held') is not None:
+            parts.append(f"平均持有 {stats['avg_days_held']} 交易日")
+        if parts:
+            lines.append(f"- {' ｜ '.join(parts)}")
         lines.append('')
 
     if not rows and not closed_today and not new_positions:
