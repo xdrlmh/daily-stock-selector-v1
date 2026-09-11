@@ -6,7 +6,7 @@
 """
 import json
 from datetime import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import pandas as pd
 from pathlib import Path
 
@@ -33,6 +33,32 @@ def format_yi(amount: float) -> str:
     if yi >= 0:
         return f'+{yi:.1f}亿'
     return f'{yi:.1f}亿'
+
+
+def safe_float(value) -> Optional[float]:
+    """None / NaN / 非数字 → None（避免 .2f 格式化崩溃）"""
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_num(value, spec: str = '.2f', suffix: str = '') -> str:
+    """None / NaN 安全的数字格式化，缺失时返回 '-'"""
+    v = safe_float(value)
+    if v is None:
+        return '-'
+    return f'{v:{spec}}{suffix}'
+
+
+def format_mcap_yi(mcap) -> str:
+    """流通市值（元）→ 亿，缺失返回 '-'"""
+    v = safe_float(mcap)
+    if v is None:
+        return '-'
+    return f'{v / 1e8:.1f}亿'
 
 
 def generate_keystrokes(df: pd.DataFrame) -> List[str]:
@@ -274,7 +300,7 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
         for i, (_, row) in enumerate(top_picks.iterrows(), 1):
             medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
             inflow = format_yi(row.get('main_net_inflow', 0))
-            score = f'{row["total_score"]:.0f}'
+            score = format_num(row.get('total_score'), '.0f')
             # 关键特征：取题材 + 当日涨幅
             catalyst = ''
             for k, v in row.get('score_breakdown', {}).items():
@@ -606,7 +632,7 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
         for i, (_, row) in enumerate(top_picks.iterrows(), 1):
             medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
             inflow = format_yi(row.get('main_net_inflow', 0))
-            score = f'{row["total_score"]:.0f}'
+            score = format_num(row.get('total_score'), '.0f')
             catalyst = ''
             for k, v in row.get('score_breakdown', {}).items():
                 if k == '题材':
@@ -701,13 +727,13 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
             lines.append(f'- 现价：**{format_price(row["price"])}** 元')
             lines.append(f'- 当日涨幅：{format_pct(row["pct_change"])}')
             lines.append(f'- 60日涨跌幅：{format_pct(row.get("pct_60d", 0))}')
-            lines.append(f'- 换手率：{row.get("turnover_rate", 0):.2f}%')
-            lines.append(f'- 量比：{row.get("volume_ratio", 0):.2f}')
-            lines.append(f'- PE-TTM：{row.get("pe_ttm", "-"):.1f}')
-            lines.append(f'- 流通市值：{row.get("circ_mcap", 0)/1e8:.1f}亿')
+            lines.append(f'- 换手率：{format_num(row.get("turnover_rate"), ".2f", "%")}')
+            lines.append(f'- 量比：{format_num(row.get("volume_ratio"), ".2f")}')
+            lines.append(f'- PE-TTM：{format_num(row.get("pe_ttm"), ".1f")}')
+            lines.append(f'- 流通市值：{format_mcap_yi(row.get("circ_mcap"))}')
             lines.append(f'- 主力净流入：{format_yi(row.get("main_net_inflow", 0))}')
             lines.append('')
-            lines.append(f'**综合评分：{row["total_score"]:.0f}/100**')
+            lines.append(f'**综合评分：{format_num(row.get("total_score"), ".0f")}/100**')
             lines.append('')
             breakdown = row.get('score_breakdown', {})
             lines.append('<details>')
@@ -835,13 +861,13 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
             lines.append(f'- 现价：**{format_price(row["price"])}** 元')
             lines.append(f'- 当日涨幅：{format_pct(row["pct_change"])}')
             lines.append(f'- 60日涨跌幅：{format_pct(row.get("pct_60d", 0))}')
-            lines.append(f'- 换手率：{row.get("turnover_rate", 0):.2f}%')
-            lines.append(f'- 量比：{row.get("volume_ratio", 0):.2f}')
-            lines.append(f'- PE-TTM：{row.get("pe_ttm", "-"):.1f}')
-            lines.append(f'- 流通市值：{row.get("circ_mcap", 0)/1e8:.1f}亿')
+            lines.append(f'- 换手率：{format_num(row.get("turnover_rate"), ".2f", "%")}')
+            lines.append(f'- 量比：{format_num(row.get("volume_ratio"), ".2f")}')
+            lines.append(f'- PE-TTM：{format_num(row.get("pe_ttm"), ".1f")}')
+            lines.append(f'- 流通市值：{format_mcap_yi(row.get("circ_mcap"))}')
             lines.append(f'- 主力净流入：{format_yi(row.get("main_net_inflow", 0))}')
             lines.append('')
-            lines.append(f'**综合评分：{row["total_score"]:.0f}/100**')
+            lines.append(f'**综合评分：{format_num(row.get("total_score"), ".0f")}/100**')
             lines.append('')
             breakdown = row.get('score_breakdown', {})
             lines.append('<details>')
