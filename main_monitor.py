@@ -25,16 +25,16 @@ from typing import List, Dict
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.portfolio import (
-    load_portfolio, get_active_holdings,
-    update_holding_alerted, close_holding
+    get_active_holdings, mark_alerted, close_holding,
+    evaluate_holding, WARNING_PROFIT_PCT,
 )
 from src.data_fetcher import _init_tushare
 from src.dingtalk import push_to_dingtalk
 from src.config import DINGTALK_WEBHOOK, DINGTALK_SECRET, TEST_ONLY
 
 
-# ============= 警戒阈值（仅预警，不自动平仓）=============
-WARNING_PROFIT_PCT = 10.0   # 接近止盈的预警阈值
+# 说明：本脚本为「手动触发」的盘中监控工具。
+# 常规止盈止损已合并到盘后复盘（main_review.py，18:30），此处仅作应急/调试用。
 
 
 def fetch_latest_prices(pro, codes: List[str]) -> Dict[str, Dict]:
@@ -96,47 +96,6 @@ def fetch_latest_prices(pro, codes: List[str]) -> Dict[str, Dict]:
     return result
 
 
-def evaluate_holding(holding: Dict, current_price: float) -> Dict:
-    """
-    评估单只持仓的状态。
-    返回 {
-        'pnl_pct': 盈亏 %,
-        'pnl_amount': 每手盈亏金额（按 100 股估算）,
-        'trigger': 'stop_loss' | 'take_profit' | 'warning' | 'normal',
-        'distance_to_stop_loss': 距止损线 %,
-        'distance_to_take_profit': 距止盈线 %,
-    }
-    """
-    buy_price = holding['buy_price']
-    if current_price <= 0 or buy_price <= 0:
-        return None
-
-    pnl_pct = (current_price / buy_price - 1) * 100
-    pnl_amount_per_100 = (current_price - buy_price) * 100  # 每 100 股盈亏
-
-    distance_to_stop = pnl_pct - holding['stop_loss_pct']      # 距止损还有多少
-    distance_to_take = holding['take_profit_pct'] - pnl_pct     # 距止盈还有多少
-
-    # 判断触发类型（按优先级）
-    # 注意：阈值判断用严格边界，pnl_pct == take_profit_pct 不算触发（要给容差）
-    if pnl_pct <= holding['stop_loss_pct']:
-        trigger = 'stop_loss'
-    elif pnl_pct > holding['take_profit_pct']:
-        trigger = 'take_profit'
-    elif pnl_pct >= WARNING_PROFIT_PCT and not holding.get('alerted'):
-        trigger = 'warning'
-    else:
-        trigger = 'normal'
-
-    return {
-        'pnl_pct': round(pnl_pct, 2),
-        'pnl_amount_per_100': round(pnl_amount_per_100, 2),
-        'trigger': trigger,
-        'distance_to_stop_loss': round(distance_to_stop, 2),
-        'distance_to_take_profit': round(distance_to_take, 2),
-    }
-
-
 def build_alert_message(holding: Dict, evaluation: Dict, current_price: float) -> Dict:
     """生成单只持仓的告警钉钉消息 payload"""
     code = holding['code']
@@ -144,7 +103,7 @@ def build_alert_message(holding: Dict, evaluation: Dict, current_price: float) -
     buy_price = holding['buy_price']
     trigger = evaluation['trigger']
     pnl_pct = evaluation['pnl_pct']
-    pnl_amount = evaluation['pnl_amount_per_100']
+    pnl_amount = (current_price - buy_price) * 100  # 每 100 股盈亏（元）
     stop_pct = holding['stop_loss_pct']
     take_pct = holding['take_profit_pct']
 
@@ -290,7 +249,7 @@ def main():
                 if ok:
                     print(f'  ✅ {h["name"]}({h["code"]}) 告警已推送')
                     # 推送成功后更新状态
-                    update_holding_alerted(h['code'])
+                    mark_alerted(h['code'])
                     if e['trigger'] == 'stop_loss' or e['trigger'] == 'take_profit':
                         close_holding(h['code'], e['pnl_pct'])
                         print(f'     → 已标记为出场 ({e["trigger"]})')
@@ -303,7 +262,7 @@ def main():
         for h, e, payload in alerts:
             print(f'  📋 {h["name"]}({h["code"]}) trigger={e["trigger"]} pnl={e["pnl_pct"]:+.2f}%')
             print(f'  📝 Title: {payload["markdown"]["title"]}')
-            update_holding_alerted(h['code'])
+            mark_alerted(h['code'])
             if e['trigger'] in ('stop_loss', 'take_profit'):
                 close_holding(h['code'], e['pnl_pct'])
     else:
