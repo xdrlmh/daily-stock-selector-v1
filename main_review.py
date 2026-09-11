@@ -12,8 +12,9 @@
    - 止损：收盘盈亏 ≤ -7%
    - 移动止盈：盈利首次 ≥ +15% 启动，跟踪启动以来最高价，回撤 8% 即卖出
      （峰值用盘中最高价更新，触发用盘中最低价判定）
-   - 时间止损：清理僵尸股（≥5 交易日且期间最高涨幅 <3%）与
-     低效股（≥10 交易日、未启动移动止盈且期间最高涨幅 <5%）
+   - 时间止损：清理僵尸股（≥8 交易日且期间最高涨幅 <3%）与
+     低效股（≥15 交易日、未启动移动止盈且期间最高涨幅 <5%）
+   - 大盘弱势熔断：上证指数当日跌幅 ≤ -2% → 当天**暂停时间止损**（止损/移动止盈照常执行）
    - 平仓后自动补仓（用当日强势股 TOP 补齐，最多 3 只）
 4. 今日强势股 TOP5（五维评分，收盘后数据）
 5. 板块温度 TOP3（按题材聚合力强板块）
@@ -45,6 +46,8 @@ from src.portfolio import (
     TRAIL_ACTIVATE_PCT, TRAIL_DRAWDOWN_PCT,
     TIME_STOP_ENABLED, TIME_STOP_REASONS,
     ZOMBIE_DAYS, ZOMBIE_PEAK_PCT, INEFFICIENT_DAYS, INEFFICIENT_PEAK_PCT,
+    MARKET_FUSE_ENABLED, MARKET_FUSE_DROP_PCT, MARKET_FUSE_INDEX,
+    market_fuse_check, mark_fused,
     get_active_holdings, evaluate_holding, close_holding, mark_alerted,
     normalize_pending_entries, advance_position_clock,
     fill_portfolio_from_candidates,
@@ -85,13 +88,15 @@ def build_price_map(spot_df: pd.DataFrame) -> dict:
     return price_map
 
 
-def settle_holdings(price_map: dict, data_date: str):
+def settle_holdings(price_map: dict, data_date: str, index_pct_change=None):
     """
     持仓结算（合并自原持仓监控）：
     1. 待入场持仓按「建仓日开盘价」归一化买入成本（行情日必须 > 信号日）；
     2. 推进交易日钟 days_held / 期间最高价 peak_high（时间止损判定依据，幂等）；
     3. 止损：收盘盈亏 ≤ -7%；移动止盈：盈利 ≥ +15% 启动，峰值回撤 8% 卖出；
-       时间止损：僵尸股（≥5 交易日且期间最高涨幅 <3%）/ 低效股（≥10 交易日且 <5%）；
+       时间止损：僵尸股（≥8 交易日且期间最高涨幅 <3%）/ 低效股（≥15 交易日且 <5%）；
+       ⚡ 大盘弱势熔断：index_pct_change ≤ -2% 时**当天不执行时间止损**（保留观察，
+          止损 / 移动止盈不受影响），次日大盘企稳自动补执行；
     4. 「接近启动线」标记已提醒，避免重复提醒。
 
     返回 (holdings_status, closed_today, price_changes, trail_started)
@@ -100,9 +105,15 @@ def settle_holdings(price_map: dict, data_date: str):
     price_changes = normalize_pending_entries(price_map, data_date)
 
     # 1.5) 推进交易日钟 + 期间最高价（仅新行情日 +1，同日重复运行不改动）
+    #      ⚠️ 熔断只「暂缓执行清理」，不影响考察期计时（次日企稳后条件仍满足即补执行）
     advanced = advance_position_clock(price_map, data_date)
     if advanced:
         log.info(f'⏱️ 已推进 {len(advanced)} 只持仓的交易日钟')
+
+    # 大盘弱势熔断判定（仅拦时间止损；止损/移动止盈照常）
+    fuse, fuse_msg = market_fuse_check(index_pct_change)
+    if fuse:
+        log.info(f'⚡ 大盘弱势熔断生效：{fuse_msg}')
 
     holdings = get_active_holdings()
     holdings_status, closed_today, trail_started = [], [], []
@@ -138,6 +149,16 @@ def settle_holdings(price_map: dict, data_date: str):
             print(f"  🔒 {h['name']}({h['code']}) 启动移动止盈 "
                   f"（峰值 {ev['trail_high']:.2f} / {ev['trail_peak_pnl']:+.2f}%，"
                   f"回撤线 {ev['trail_trigger_price']:.2f}）")
+
+        # ⚡ 大盘弱势熔断：时间止损当天不执行（保留观察，避免暴跌日卖在最低点）
+        if fuse and ev['trigger'] in TIME_STOP_REASONS:
+            mark_fused(ev, fuse_msg)
+            holdings_status.append(ev)
+            peak_txt = (f"{ev['peak_high_pnl']:+.2f}%"
+                        if ev.get('peak_high_pnl') is not None else '-')
+            print(f"  ⚡ {h['name']}({h['code']}) 时间止损暂缓（大盘熔断）"
+                  f"：持有 {ev.get('days_held')} 交易日 / 期间最高 {peak_txt} → 保留观察")
+            continue
 
         if ev['trigger'] in ('stop_loss', 'take_profit') or ev['trigger'] in TIME_STOP_REASONS:
             reason = ev['trigger']
@@ -212,6 +233,11 @@ def main():
     market = fetch_market_review()
     data_date = market.get('data_date') or datetime.now().strftime('%Y%m%d')
     print(f'📅 本次复盘数据日期：{data_date}')
+    idx_pct = market.get('index_pct_change')
+    if MARKET_FUSE_ENABLED and idx_pct is not None:
+        fuse_now, fuse_now_msg = market_fuse_check(idx_pct)
+        print(f'{MARKET_FUSE_INDEX} 当日 {idx_pct:+.2f}%'
+              + (f'  ⚡ 触发大盘熔断（阈值 {MARKET_FUSE_DROP_PCT}%）' if fuse_now else ''))
 
     # 5. 今日强势股 TOP5（收盘后重筛）
     top_picks, warnings, all_scored = screen_stocks(enriched)
@@ -224,7 +250,8 @@ def main():
 
     # 7. 💼 持仓结算 + 自动补仓（原持仓监控已合并于此）
     price_map = build_price_map(spot_df)
-    holdings_status, closed_today, price_changes, trail_started = settle_holdings(price_map, data_date)
+    holdings_status, closed_today, price_changes, trail_started = settle_holdings(
+        price_map, data_date, index_pct_change=idx_pct)
     log.info(f'持仓结算完成：活跃 {len(holdings_status)} 只 / 今日平仓 {len(closed_today)} 只 / '
              f'新启动移动止盈 {len(trail_started)} 只')
 
@@ -302,6 +329,9 @@ def main():
     if TIME_STOP_ENABLED:
         print(f'🧹 时间止损：僵尸 ≥{ZOMBIE_DAYS}日且期间最高 <{ZOMBIE_PEAK_PCT}% ｜ '
               f'低效 ≥{INEFFICIENT_DAYS}日且未启动且 <{INEFFICIENT_PEAK_PCT}%')
+    if MARKET_FUSE_ENABLED:
+        print(f'⚡ 大盘熔断：{MARKET_FUSE_INDEX} 单日 ≤{MARKET_FUSE_DROP_PCT}% '
+              f'→ 当天暂停时间止损（止损/移动止盈不受影响）')
     print('=' * 60)
     for i, r in enumerate(holdings_status, 1):
         flag = '⏳待开盘价' if r.get('entry_pending') else r.get('status_text', '')
@@ -313,6 +343,15 @@ def main():
             clock = f"  持有{int(r.get('days_held') or 0)}日{tk}"
         print(f"  {i}. {r['name']}({r['code']}) {r['buy_price']:.2f} → {r['current_price']:.2f} "
               f"{r['pnl_pct']:+.2f}%  {flag}{peak}{clock}")
+    fused_rows = [r for r in holdings_status if r.get('fused')]
+    if fused_rows:
+        print(f'\n⚡ 大盘熔断：今日暂缓时间止损 {len(fused_rows)} 只'
+              f'（持仓不变，大盘企稳后自动补执行）：')
+        for r in fused_rows:
+            peak = r.get('peak_high_pnl')
+            peak_txt = f'{peak:+.2f}%' if peak is not None else '-'
+            print(f"  [{r.get('status_text')}] {r['name']}({r['code']}) "
+                  f"持有 {int(r.get('days_held') or 0)} 日 / 期间最高 {peak_txt}")
     if trail_started:
         print(f'\n🔒 今日启动移动止盈 {len(trail_started)} 只：')
         for r in trail_started:
