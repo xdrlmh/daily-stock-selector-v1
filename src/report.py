@@ -10,6 +10,22 @@ from typing import Dict, List, Tuple, Any, Optional
 import pandas as pd
 from pathlib import Path
 
+# 持仓规则常量统一从 portfolio 模块取（单一来源，防止两处默认值走偏）
+try:
+    from src.portfolio import (
+        MAX_HOLDINGS as _MAX_HOLDINGS,
+        DEFAULT_STOP_LOSS_PCT as _STOP_LOSS_PCT,
+        TRAIL_ACTIVATE_PCT as _TRAIL_ACTIVATE_PCT,
+        TRAIL_DRAWDOWN_PCT as _TRAIL_DRAWDOWN_PCT,
+    )
+except ImportError:  # 兼容以顶层模块方式导入
+    from portfolio import (
+        MAX_HOLDINGS as _MAX_HOLDINGS,
+        DEFAULT_STOP_LOSS_PCT as _STOP_LOSS_PCT,
+        TRAIL_ACTIVATE_PCT as _TRAIL_ACTIVATE_PCT,
+        TRAIL_DRAWDOWN_PCT as _TRAIL_DRAWDOWN_PCT,
+    )
+
 
 def format_price(price: float) -> str:
     if pd.isna(price):
@@ -449,10 +465,10 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                               new_positions: List[Dict] = None,
                               trail_started: List[Dict] = None,
                               stats: Dict = None,
-                              max_holdings: int = 3,
-                              stop_loss_pct: float = -7.0,
-                              trail_activate_pct: float = 15.0,
-                              trail_drawdown_pct: float = 5.0) -> List[str]:
+                              max_holdings: int = _MAX_HOLDINGS,
+                              stop_loss_pct: float = _STOP_LOSS_PCT,
+                              trail_activate_pct: float = _TRAIL_ACTIVATE_PCT,
+                              trail_drawdown_pct: float = _TRAIL_DRAWDOWN_PCT) -> List[str]:
     """
     生成「模拟盘持仓」markdown 段（移动止盈结算 / 自动补仓结果）
 
