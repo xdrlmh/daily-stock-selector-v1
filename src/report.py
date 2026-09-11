@@ -421,21 +421,25 @@ def format_md_date(date_str: str) -> str:
 def generate_holdings_section(holdings_status: List[Dict] = None,
                               closed_today: List[Dict] = None,
                               new_positions: List[Dict] = None,
+                              trail_started: List[Dict] = None,
                               stats: Dict = None,
                               max_holdings: int = 3,
                               stop_loss_pct: float = -7.0,
-                              take_profit_pct: float = 15.0) -> List[str]:
+                              trail_activate_pct: float = 15.0,
+                              trail_drawdown_pct: float = 5.0) -> List[str]:
     """
-    生成「模拟盘持仓」markdown 段（买卖监控 / 自动补仓结果）
+    生成「模拟盘持仓」markdown 段（移动止盈结算 / 自动补仓结果）
 
     - holdings_status：当前活跃持仓的评估结果列表
-    - closed_today：当日触发止盈/止损并已平仓的持仓
+    - closed_today：当日触发止损/移动止盈并已平仓的持仓
     - new_positions：当日自动补仓的新增持仓
+    - trail_started：当日新启动移动止盈的持仓
     - stats：累计战绩（portfolio_stats() 的返回值）
     """
     rows = holdings_status or []
     closed_today = closed_today or []
     new_positions = new_positions or []
+    trail_started = trail_started or []
 
     lines = [f'## 💼 模拟盘持仓（{len(rows)}/{max_holdings}）', '']
 
@@ -443,29 +447,53 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
         lines.append('| # | 代码 | 名称 | 买入日 | 买入价 | 现价 | 盈亏 | 距止损 | 距止盈 | 状态 |')
         lines.append('|---|---|---|---|---|---|---|---|---|---|')
         for i, r in enumerate(rows, 1):
+            trail_active = bool(r.get('trail_active'))
             if r.get('entry_pending'):
                 status = '⏳ 待开盘价'
+            elif trail_active and r.get('trail_high'):
+                # 已启动移动止盈 → 状态里带上峰值，一眼看出锁利位置
+                status = f"🔒 移动止盈(峰{r['trail_peak_pnl']:+.0f}%)"
             else:
                 status = r.get('status_text') or '🟢 正常持有'
             bdate = format_md_date(r.get('entry_date') or r.get('buy_date'))
+            # 距止盈：未启动＝距启动线；已启动＝距回撤触发线
+            dist_tp = r.get('distance_to_take_profit')
+            dist_txt = f'{dist_tp:+.1f}%' if dist_tp is not None else '-'
             lines.append(
                 f"| {i} | {r['code']} | {r['name']} | {bdate} | "
                 f"{r['buy_price']:.2f} | {r['current_price']:.2f} | "
                 f"**{r['pnl_pct']:+.2f}%** | "
-                f"{r['distance_to_stop_loss']:+.1f}% | {r['distance_to_take_profit']:+.1f}% | {status} |"
+                f"{r['distance_to_stop_loss']:+.1f}% | {dist_txt} | {status} |"
             )
         lines.append('')
-        lines.append(f'> 💡 买入价＝信号次日开盘价（模拟盘口径）｜止损 {stop_loss_pct}% ／ 止盈 +{take_profit_pct}%')
+        lines.append(f'> 💡 买入价＝信号次日开盘价（模拟盘口径）｜止损 {stop_loss_pct}% ／ '
+                     f'盈利 +{trail_activate_pct}% 启动**移动止盈**（峰值回撤 {trail_drawdown_pct}% 卖出）')
         lines.append('')
 
-    # 今日触发（止盈/止损）
+    # 今日新启动移动止盈
+    if trail_started:
+        lines.append('### 🔒 今日启动移动止盈')
+        lines.append('')
+        for r in trail_started:
+            lines.append(
+                f"- 🔒 **{r.get('name')}({r.get('code')})** 峰值 {r.get('trail_high'):.2f}"
+                f"（{r.get('trail_peak_pnl'):+.1f}%）→ 回撤线 **{r.get('trail_trigger_price'):.2f}**"
+            )
+        lines.append('')
+        lines.append(f'> 说明：触发线随峰值上移（只上不下），跌破回撤线即卖出。')
+        lines.append('')
+
+    # 今日触发（移动止盈 / 止损）
     if closed_today:
         lines.append('### 🚨 今日触发')
         lines.append('')
         for h in closed_today:
             reason = h.get('close_reason')
+            peak = h.get('closed_peak_pnl')
             if reason == 'take_profit':
-                icon, label = '🎯', '达标止盈'
+                icon, label = '🔒', '移动止盈卖出'
+                if peak is not None:
+                    label += f'（峰值 {peak:+.1f}%）'
             elif reason == 'stop_loss':
                 icon, label = '🚨', '触发止损'
             else:
@@ -513,13 +541,14 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
                             holdings_status: List[Dict] = None,
                             closed_today: List[Dict] = None,
                             new_positions: List[Dict] = None,
+                            trail_started: List[Dict] = None,
                             stats: Dict = None,
                             data_date: str = None) -> Dict:
     """
     生成「主升浪盘后复盘」钉钉消息 payload（18:30 推送）
     核心模块：
     - 大盘复盘（指数/主力/趋势/成交额/市场情绪）
-    - 💼 模拟盘持仓（止盈止损结算 + 自动补仓结果）—— 已合并原「持仓监控」
+    - 💼 模拟盘持仓（移动止盈结算 + 自动补仓结果）—— 已合并原「持仓监控」
     - 今日强势股 TOP5（收盘后五维评分重筛）
     - 板块温度 TOP3（按题材聚合力强板块）
     - 明日展望
@@ -559,11 +588,12 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
             lines.append(f'- **市场情绪**：涨停 {lu} ｜ 跌停 {ld or 0} ｜ 涨跌比 {up}:{down}')
         lines.append('')
 
-    # ---- 💼 模拟盘持仓（止盈止损结算 + 自动补仓）----
+    # ---- 💼 模拟盘持仓（移动止盈结算 + 自动补仓）----
     lines.extend(generate_holdings_section(
         holdings_status=holdings_status,
         closed_today=closed_today,
         new_positions=new_positions,
+        trail_started=trail_started,
         stats=stats,
     ))
 
@@ -754,6 +784,7 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
                        holdings_status: List[Dict] = None,
                        closed_today: List[Dict] = None,
                        new_positions: List[Dict] = None,
+                       trail_started: List[Dict] = None,
                        stats: Dict = None,
                        data_date: str = None) -> str:
     """
@@ -784,11 +815,12 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
             lines.append(f'- **市场情绪**：涨停 {lu} ｜ 跌停 {ld or 0} ｜ 涨跌比 {up}:{down}')
         lines.append('')
 
-    # 💼 模拟盘持仓（止盈止损结算 + 自动补仓）
+    # 💼 模拟盘持仓（移动止盈结算 + 自动补仓）
     lines.extend(generate_holdings_section(
         holdings_status=holdings_status,
         closed_today=closed_today,
         new_positions=new_positions,
+        trail_started=trail_started,
         stats=stats,
     ))
 
