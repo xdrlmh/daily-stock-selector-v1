@@ -1,5 +1,34 @@
 {
   "version": 2,
   "updated_at": "",
-  "holdings": []
+  "holdings": [
+    {
+      "code": "601398",
+      "name": "工商银行",
+      "buy_price": 8.2,
+      "buy_date": "2026-09-10",
+      "entry_date": "2026-09-10",
+      "entry_pending": false,
+      "shares": 0,
+      "stop_loss_pct": -7.0,
+      "trail_activate_pct": 15.0,
+      "trail_drawdown_pct": 8.0,
+      "trail_active": false,
+      "trail_high": null,
+      "days_held": 7,
+      "last_review_date": "2026-09-09",
+      "peak_high": 8.21,
+      "take_profit_pct": 15.0,
+      "alerted": true,
+      "alerted_at": null,
+      "closed": false,
+      "closed_at": null,
+      "closed_price": null,
+      "closed_pnl": null,
+      "close_reason": null,
+      "closed_peak_pnl": null,
+      "closed_days_held": null,
+      "source": "morning_screen"
+    }
+  ]
 }
