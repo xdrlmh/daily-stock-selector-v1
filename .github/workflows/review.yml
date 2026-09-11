@@ -56,5 +56,6 @@ jobs:
             echo "持仓池无变化，跳过提交"
           else
             git commit -m "chore: 持仓结算与补仓 $(date +'%Y-%m-%d %H:%M')"
+            git pull --rebase --autostash origin main
             git push
           fi
