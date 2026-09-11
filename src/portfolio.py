@@ -5,14 +5,14 @@
 1. 最多同时持有 MAX_HOLDINGS(3) 只；
 2. 买入价按「信号日次日开盘价」归一化（贴近模拟盘真实买入成本）；
 3. 止盈＝**移动止盈**：盈利首次达到 +15% 后启动，随后跟踪启动以来的最高价，
-   从最高价回撤 5% 即卖出（保护利润，同时不切断主升浪）；
+   从最高价回撤 8% 即卖出（保护利润，同时给主升浪留足呼吸空间）；
 4. 平仓后自动补仓（由盘后复盘流程调用，详见 main_review.py）；
 5. 持仓池持久化到 data/portfolio.json（GitHub Actions 中由 workflow 回写仓库）。
 
 移动止盈细则：
 - 启动线：盈利 ≥ trail_activate_pct（默认 +15%）
 - 峰值 trail_high：取「盘中最高价」与收盘价中的较大者，逐日抬升（只上不下）
-- 触发线：trail_high × (1 - trail_drawdown_pct/100)，默认回撤 5%
+- 触发线：trail_high × (1 - trail_drawdown_pct/100)，默认回撤 8%
 - 判定：盘中最低价 ≤ 触发线 → 视为触发，成交价＝触发线（贴近真实移动止盈单）
 - 止损优先：收盘盈亏 ≤ stop_loss_pct（默认 -7%）时直接止损，不再看移动止盈
 
@@ -30,7 +30,7 @@
       "shares": 0,
       "stop_loss_pct": -7.0,           # 固定止损
       "trail_activate_pct": 15.0,      # 移动止盈启动线
-      "trail_drawdown_pct": 5.0,       # 启动后回撤卖出幅度
+      "trail_drawdown_pct": 8.0,       # 启动后回撤卖出幅度
       "trail_active": false,           # 移动止盈是否已启动
       "trail_high": null,              # 启动以来的最高价（只上不下）
       "alerted": false, "alerted_at": null,
@@ -55,7 +55,7 @@ PORTFOLIO_PATH = DATA_DIR / 'portfolio.json'
 # ============= 持仓参数 =============
 DEFAULT_STOP_LOSS_PCT = -7.0     # 固定止损 -7%
 TRAIL_ACTIVATE_PCT = 15.0        # 盈利达到 +15% 启动移动止盈
-TRAIL_DRAWDOWN_PCT = 5.0         # 启动后从最高价回撤 5% → 卖出
+TRAIL_DRAWDOWN_PCT = 8.0         # 启动后从最高价回撤 8% → 卖出（3=激进锁利 / 8=宽吃趋势）
 WARNING_PROFIT_PCT = 10.0        # 接近启动线的提醒阈值
 DEFAULT_TAKE_PROFIT_PCT = TRAIL_ACTIVATE_PCT   # 兼容旧字段/旧调用（含义＝启动线）
 MAX_HOLDINGS = 3                 # 最大同时持仓数（模拟盘买进头 3 只）
@@ -499,7 +499,15 @@ def fill_portfolio_from_candidates(candidates_df, exclude_codes: Optional[List[s
 
 def normalize_pending_entries(price_map: Dict[str, Dict], data_date: str) -> List[Dict]:
     """
-    把「待定入场价」的持仓按当日开盘价归一化（贴近模拟盘实际买入成本）。
+    把「待定入场价」的持仓按建仓日开盘价归一化（贴近模拟盘实际买入成本）。
+
+    ⚠️ 日期判断（关键）：
+        模拟盘口径是「信号次日开盘价成交」，所以只有在 **行情日严格晚于信号日**
+        （data_date > buy_date）时才允许归一化。
+        - 信号当日（同日重复跑复盘 / 早盘选股后当天复盘）→ 跳过，保持待定；
+        - 行情日早于信号日（数据回退）→ 跳过，避免用错误日期的开盘价污染成本。
+        这样保证成本基准永远是「信号次日的真实开盘价」，且重复运行幂等。
+
     price_map: {code: {'open': float, 'price': float, ...}}
     data_date: 行情日期（YYYYMMDD 或 YYYY-MM-DD）
     返回被归一化的持仓列表（含 old/new 价格）。
@@ -510,6 +518,17 @@ def normalize_pending_entries(price_map: Dict[str, Dict], data_date: str) -> Lis
     for h in portfolio.get('holdings', []):
         if h.get('closed') or not h.get('entry_pending'):
             continue
+
+        # ---- 日期判断：行情日必须严格晚于信号日 ----
+        sig_date = _fmt_date(h.get('buy_date')) if h.get('buy_date') else ''
+        if not sig_date:
+            print(f'  ⚠️ {h.get("name")}({h["code"]}) 缺少信号日 buy_date，跳过归一化')
+            continue
+        if date_str <= sig_date:
+            print(f'  ⏳ {h.get("name")}({h["code"]}) 等待建仓日开盘价'
+                  f'（行情日 {date_str} ≤ 信号日 {sig_date}，暂不归一化）')
+            continue
+
         info = price_map.get(h['code'])
         if not info:
             continue
@@ -524,13 +543,15 @@ def normalize_pending_entries(price_map: Dict[str, Dict], data_date: str) -> Lis
         h['trail_active'] = False
         h['trail_high'] = None
         changed.append({'code': h['code'], 'name': h.get('name', ''),
-                        'old': old, 'new': h['buy_price'], 'entry_date': date_str})
+                        'old': old, 'new': h['buy_price'], 'entry_date': date_str,
+                        'signal_date': sig_date})
 
     if changed:
         save_portfolio(portfolio)
         for c in changed:
             print(f'  🔧 归一化入场价: {c["name"]}({c["code"]}) '
-                  f'{c["old"]} → {c["new"]}（{c["entry_date"]} 开盘）')
+                  f'{c["old"]} → {c["new"]}（信号日 {c["signal_date"]} → '
+                  f'建仓日 {c["entry_date"]} 开盘）')
     return changed
 
 
