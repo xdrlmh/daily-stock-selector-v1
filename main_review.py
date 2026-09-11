@@ -8,9 +8,12 @@
 3. 💼 模拟盘持仓结算（原「持仓止盈止损监控」已合并到此）：
    - 待入场持仓按「建仓日开盘价」归一化买入成本
      （日期判断：仅当行情日 > 信号日才归一化，信号当日/重复运行一律跳过）
+   - 推进交易日钟：days_held +1（仅新行情日）/ 更新期间最高价 peak_high
    - 止损：收盘盈亏 ≤ -7%
    - 移动止盈：盈利首次 ≥ +15% 启动，跟踪启动以来最高价，回撤 8% 即卖出
      （峰值用盘中最高价更新，触发用盘中最低价判定）
+   - 时间止损：清理僵尸股（≥8 交易日且期间最高涨幅 <3%）与
+     低效股（≥15 交易日、未启动移动止盈且期间最高涨幅 <5%）
    - 平仓后自动补仓（用当日强势股 TOP 补齐，最多 3 只）
 4. 今日强势股 TOP5（五维评分，收盘后数据）
 5. 板块温度 TOP3（按题材聚合力强板块）
@@ -40,8 +43,11 @@ from src.dingtalk import push_to_dingtalk
 from src.portfolio import (
     MAX_HOLDINGS, DEFAULT_STOP_LOSS_PCT,
     TRAIL_ACTIVATE_PCT, TRAIL_DRAWDOWN_PCT,
+    TIME_STOP_ENABLED, TIME_STOP_REASONS,
+    ZOMBIE_DAYS, ZOMBIE_PEAK_PCT, INEFFICIENT_DAYS, INEFFICIENT_PEAK_PCT,
     get_active_holdings, evaluate_holding, close_holding, mark_alerted,
-    normalize_pending_entries, fill_portfolio_from_candidates,
+    normalize_pending_entries, advance_position_clock,
+    fill_portfolio_from_candidates,
     update_trail_states, make_status_placeholder, portfolio_stats,
 )
 
@@ -83,13 +89,20 @@ def settle_holdings(price_map: dict, data_date: str):
     """
     持仓结算（合并自原持仓监控）：
     1. 待入场持仓按「建仓日开盘价」归一化买入成本（行情日必须 > 信号日）；
-    2. 止损：收盘盈亏 ≤ -7%；移动止盈：盈利 ≥ +15% 启动，峰值回撤 8% 卖出；
-    3. 「接近启动线」标记已提醒，避免重复提醒。
+    2. 推进交易日钟 days_held / 期间最高价 peak_high（时间止损判定依据，幂等）；
+    3. 止损：收盘盈亏 ≤ -7%；移动止盈：盈利 ≥ +15% 启动，峰值回撤 8% 卖出；
+       时间止损：僵尸股（≥8 交易日且期间最高涨幅 <3%）/ 低效股（≥15 交易日且 <5%）；
+    4. 「接近启动线」标记已提醒，避免重复提醒。
 
     返回 (holdings_status, closed_today, price_changes, trail_started)
     """
     # 1) 归一化待入场价（信号日收盘价 → 实际建仓日开盘价）
     price_changes = normalize_pending_entries(price_map, data_date)
+
+    # 1.5) 推进交易日钟 + 期间最高价（仅新行情日 +1，同日重复运行不改动）
+    advanced = advance_position_clock(price_map, data_date)
+    if advanced:
+        log.info(f'⏱️ 已推进 {len(advanced)} 只持仓的交易日钟')
 
     holdings = get_active_holdings()
     holdings_status, closed_today, trail_started = [], [], []
@@ -126,19 +139,30 @@ def settle_holdings(price_map: dict, data_date: str):
                   f"（峰值 {ev['trail_high']:.2f} / {ev['trail_peak_pnl']:+.2f}%，"
                   f"回撤线 {ev['trail_trigger_price']:.2f}）")
 
-        if ev['trigger'] in ('stop_loss', 'take_profit'):
+        if ev['trigger'] in ('stop_loss', 'take_profit') or ev['trigger'] in TIME_STOP_REASONS:
             reason = ev['trigger']
+            # 移动止盈用 trail 峰值；其余（止损/时间止损）用期间最高涨幅
+            peak = ev['trail_peak_pnl'] if reason == 'take_profit' else ev['peak_high_pnl']
             closed = close_holding(h['code'], ev['exit_pnl_pct'], reason=reason,
-                                   price=ev['exit_price'], peak_pnl=ev['trail_peak_pnl'])
+                                   price=ev['exit_price'], peak_pnl=peak,
+                                   days_held=ev.get('days_held'))
             if closed:
                 closed_today.append(closed)
                 if reason == 'take_profit':
                     print(f"  🔒 {h['name']}({h['code']}) 移动止盈卖出 "
                           f"{ev['exit_pnl_pct']:+.2f}%（峰值 {ev['trail_peak_pnl']:+.2f}% "
                           f"→ 回撤至 {ev['exit_price']:.2f}）")
-                else:
+                elif reason == 'stop_loss':
                     print(f"  🚨 {h['name']}({h['code']}) 触发止损 "
                           f"{ev['exit_pnl_pct']:+.2f}% → 已平仓")
+                else:
+                    icon = '🧟' if reason == 'time_stop_zombie' else '🐌'
+                    label = '僵尸股' if reason == 'time_stop_zombie' else '低效股'
+                    peak_txt = (f"{ev['peak_high_pnl']:+.2f}%"
+                                if ev.get('peak_high_pnl') is not None else '-')
+                    print(f"  {icon} {h['name']}({h['code']}) 时间止损·{label}清理 "
+                          f"{ev['exit_pnl_pct']:+.2f}%（持有 {ev.get('days_held')} 交易日 / "
+                          f"期间最高 {peak_txt}）→ 已平仓（让位补仓）")
             continue  # 已平仓，不再计入活跃持仓表
 
         holdings_status.append(ev)
@@ -275,13 +299,20 @@ def main():
     print('\n' + '=' * 60)
     print(f'💼 持仓（上限 {MAX_HOLDINGS} 只）｜ 止损 {DEFAULT_STOP_LOSS_PCT}% ｜ '
           f'移动止盈：+{TRAIL_ACTIVATE_PCT}% 启动 / 回撤 {TRAIL_DRAWDOWN_PCT}% 卖出')
+    if TIME_STOP_ENABLED:
+        print(f'🧹 时间止损：僵尸 ≥{ZOMBIE_DAYS}日且期间最高 <{ZOMBIE_PEAK_PCT}% ｜ '
+              f'低效 ≥{INEFFICIENT_DAYS}日且未启动且 <{INEFFICIENT_PEAK_PCT}%')
     print('=' * 60)
     for i, r in enumerate(holdings_status, 1):
         flag = '⏳待开盘价' if r.get('entry_pending') else r.get('status_text', '')
         peak = (f" 峰值{r['trail_high']:.2f}({r['trail_peak_pnl']:+.1f}%)/回撤线{r['trail_trigger_price']:.2f}"
                 if r.get('trail_active') and r.get('trail_high') else '')
+        clock = ''
+        if not r.get('entry_pending'):
+            tk = f" {r['time_stop_hint']}" if r.get('time_stop_hint') else ''
+            clock = f"  持有{int(r.get('days_held') or 0)}日{tk}"
         print(f"  {i}. {r['name']}({r['code']}) {r['buy_price']:.2f} → {r['current_price']:.2f} "
-              f"{r['pnl_pct']:+.2f}%  {flag}{peak}")
+              f"{r['pnl_pct']:+.2f}%  {flag}{peak}{clock}")
     if trail_started:
         print(f'\n🔒 今日启动移动止盈 {len(trail_started)} 只：')
         for r in trail_started:
@@ -291,11 +322,22 @@ def main():
         print(f'\n🚨 今日平仓 {len(closed_today)} 只：')
         for h in closed_today:
             reason = h.get('close_reason')
-            label = '移动止盈' if reason == 'take_profit' else ('止损' if reason == 'stop_loss' else reason)
+            if reason == 'take_profit':
+                label = '移动止盈'
+            elif reason == 'stop_loss':
+                label = '止损'
+            elif reason == 'time_stop_zombie':
+                label = '🧟 时间止损·僵尸'
+            elif reason == 'time_stop_inefficient':
+                label = '🐌 时间止损·低效'
+            else:
+                label = reason
             peak = h.get('closed_peak_pnl')
             peak_txt = f"（峰值{peak:+.2f}%）" if peak is not None else ''
+            days = h.get('closed_days_held')
+            days_txt = f" 持有{days}日" if days is not None else ''
             print(f"  [{label}] {h['name']}({h['code']}) "
-                  f"{h.get('closed_pnl'):+.2f}%{peak_txt} @ {h.get('closed_price')}")
+                  f"{h.get('closed_pnl'):+.2f}%{peak_txt}{days_txt} @ {h.get('closed_price')}")
     if new_positions:
         print(f'\n🛒 今日补仓 {len(new_positions)} 只：')
         for h in new_positions:
