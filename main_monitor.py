@@ -1,19 +1,21 @@
 """
-持仓监控主入口
+持仓监控主入口（手动触发 / 应急用）
 ==========================
 - 读取 portfolio.json 中的活跃持仓
-- 拉取每只票的最新价
+- 拉取每只票的最新价（含当日最高/最低）
 - 计算盈亏 %
-- 判断是否触发止盈/止损
+- 判断是否触发止损 / 移动止盈
 - 生成钉钉告警消息（仅在触发时推送，避免噪音）
-- 推送后更新 alerted 标志位 / closed 标志位
+- 推送后更新 trail_active / trail_high / closed 标志位
 
 触发规则：
 - 止损：盈亏 ≤ stop_loss_pct（默认 -7%）
-- 止盈：盈亏 ≥ take_profit_pct（默认 +15%）
-- 警戒：盈亏 ≥ +10%（接近止盈，给个温和提醒）
+- 移动止盈：盈利首次 ≥ +15% 启动；启动后峰值回撤 5% 即卖出
+  （峰值用盘中最高价，触发用盘中最低价）
+- 警戒：盈利 ≥ +10%（接近启动线，给个温和提醒）
 
-每个交易日 09:30-15:00 每 30 分钟跑一次（cron 控制）
+⚠️ 常规止盈止损已合并到盘后复盘（main_review.py，18:30）。
+   本脚本仅供盘中应急/调试手动触发，已取消定时调度。
 """
 import os
 import sys
@@ -26,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.portfolio import (
     get_active_holdings, mark_alerted, close_holding,
-    evaluate_holding, WARNING_PROFIT_PCT,
+    evaluate_holding, update_trail_states, WARNING_PROFIT_PCT,
 )
 from src.data_fetcher import _init_tushare
 from src.dingtalk import push_to_dingtalk
@@ -104,30 +106,39 @@ def build_alert_message(holding: Dict, evaluation: Dict, current_price: float) -
     trigger = evaluation['trigger']
     pnl_pct = evaluation['pnl_pct']
     pnl_amount = (current_price - buy_price) * 100  # 每 100 股盈亏（元）
-    stop_pct = holding['stop_loss_pct']
-    take_pct = holding['take_profit_pct']
+    stop_pct = evaluation.get('stop_loss_pct', holding.get('stop_loss_pct'))
+    activate_pct = evaluation.get('trail_activate_pct')
+    drawdown_pct = evaluation.get('trail_drawdown_pct')
+    peak = evaluation.get('trail_high')
+    trigger_px = evaluation.get('trail_trigger_price')
 
     # 不同触发的 emoji + 标题
     if trigger == 'stop_loss':
         emoji = '🚨'
         title_emoji = '🚨'
         status_text = f'**已破止损线 {stop_pct}%**'
-        advice = f'⚠️ 建议立即决策：止损出局 / 持有观望（明确止损纪律）'
+        advice = '⚠️ 建议立即决策：止损出局 / 持有观望（明确止损纪律）'
     elif trigger == 'take_profit':
-        emoji = '🎯'
-        title_emoji = '🎯'
-        status_text = f'**已达止盈线 +{take_pct}%**'
-        advice = f'💡 建议分批止盈：可考虑先减半仓，剩余博更高（注意回撤）'
+        emoji = '🔒'
+        title_emoji = '🔒'
+        peak_txt = f'（峰值 +{evaluation.get("trail_peak_pnl", 0):.2f}%）' if peak else ''
+        status_text = f'**移动止盈触发 → 卖出 {pnl_pct:+.2f}%**{peak_txt}'
+        advice = f'💡 峰值回撤 {drawdown_pct}% 已触发，移动止盈落袋为安'
     elif trigger == 'warning':
         emoji = '⚡'
         title_emoji = '⚡'
-        status_text = f'**接近止盈（+{pnl_pct}%）**'
-        advice = f'💡 接近止盈线 {take_pct}%，可开始关注分批止盈计划'
+        status_text = f'**接近移动止盈启动线（+{pnl_pct}%）**'
+        advice = f'💡 距启动线 +{activate_pct}% 还差 {evaluation.get("distance_to_take_profit", 0):.2f}%，可提前规划'
     else:
         # 正常状态，不应该推送（除非是 summary）
         return None
 
     title = f'{title_emoji} 持仓监控告警 · {name}({code})'
+
+    trail_line = ''
+    if evaluation.get('trail_active') and peak and trigger_px:
+        trail_line = (f'\n- 移动止盈：已启动 ｜ 峰值 {peak:.2f} ｜ 回撤线 {trigger_px:.2f}'
+                      f'（回撤 {evaluation.get("trail_drawdown_pct")}% 卖出）')
 
     text = f"""## {title}
 
@@ -142,7 +153,7 @@ def build_alert_message(holding: Dict, evaluation: Dict, current_price: float) -
 | 状态 | {status_text} |
 
 - 距止损线 ({stop_pct}%)：还差 {evaluation['distance_to_stop_loss']:.2f}%
-- 距止盈线 (+{take_pct}%)：还差 {evaluation['distance_to_take_profit']:.2f}%
+- 距启动/回撤线：还差 {evaluation.get('distance_to_take_profit', 0):.2f}%{trail_line}
 
 {advice}
 
@@ -166,7 +177,7 @@ def build_summary_message(holdings: List[Dict], evaluations: List[Dict]) -> Dict
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
     lines = [f'## 📊 持仓监控汇总 · {now}\n']
     lines.append(f'**共监控 {len(holdings)} 只持仓**\n')
-    lines.append('| # | 名称(代码) | 买入价 | 现价 | 盈亏% | 距止损 | 距止盈 | 状态 |')
+    lines.append('| # | 名称(代码) | 买入价 | 现价 | 盈亏% | 距止损 | 距启动/回撤 | 状态 |')
     lines.append('|---|---|---|---|---|---|---|---|')
 
     for i, (h, e) in enumerate(zip(holdings, evaluations), 1):
@@ -176,15 +187,19 @@ def build_summary_message(holdings: List[Dict], evaluations: List[Dict]) -> Dict
         if e['trigger'] == 'stop_loss':
             status = '🚨 止损'
         elif e['trigger'] == 'take_profit':
-            status = '🎯 止盈'
+            status = '🔒 移动止盈卖出'
+        elif e.get('trail_active'):
+            status = f"🔒 移动止盈中(峰{e.get('trail_peak_pnl', 0):+.0f}%)"
         elif e['trigger'] == 'warning':
-            status = '⚡ 警戒'
+            status = '⚡ 接近启动'
         else:
             status = '🟢 正常'
+        dist = e.get('distance_to_take_profit')
+        dist_txt = f'{dist:.1f}%' if dist is not None else '-'
         lines.append(
             f"| {i} | {h['name']}({h['code']}) | {h['buy_price']:.2f} | "
             f"{e.get('current_price', 0):.2f} | **{e['pnl_pct']:+.2f}%** | "
-            f"{e['distance_to_stop_loss']:.1f}% | {e['distance_to_take_profit']:.1f}% | {status} |"
+            f"{e['distance_to_stop_loss']:.1f}% | {dist_txt} | {status} |"
         )
 
     text = '\n'.join(lines)
@@ -221,22 +236,30 @@ def main():
     # 评估每只持仓
     evaluations = []
     alerts = []
+    trail_updates = []
     for h in holdings:
         info = prices.get(h['code'])
         if not info or info['price'] <= 0:
             print(f'  ⏭️ {h["name"]}({h["code"]}) 无行情数据')
             continue
-        eval_result = evaluate_holding(h, info['price'])
+        eval_result = evaluate_holding(h, info['price'],
+                                       day_high=info.get('high'), day_low=info.get('low'))
         if eval_result is None:
             continue
         eval_result['current_price'] = info['price']
         evaluations.append((h, eval_result))
+        trail_updates.append({'code': h['code'],
+                              'trail_active': eval_result['trail_active'],
+                              'trail_high': eval_result['trail_high']})
 
         # 检查是否需要告警（且未告警过）
         if eval_result['trigger'] in ('stop_loss', 'take_profit', 'warning') and not h.get('alerted'):
             payload = build_alert_message(h, eval_result, info['price'])
             if payload:
                 alerts.append((h, eval_result, payload))
+
+    # 落盘移动止盈状态（峰值抬升 / 新启动）
+    update_trail_states(trail_updates)
 
     # 推送告警（每个持仓单独推送）
     if alerts and not TEST_ONLY:
@@ -250,8 +273,10 @@ def main():
                     print(f'  ✅ {h["name"]}({h["code"]}) 告警已推送')
                     # 推送成功后更新状态
                     mark_alerted(h['code'])
-                    if e['trigger'] == 'stop_loss' or e['trigger'] == 'take_profit':
-                        close_holding(h['code'], e['pnl_pct'])
+                    if e['trigger'] in ('stop_loss', 'take_profit'):
+                        close_holding(h['code'], e['exit_pnl_pct'] if e['exit_pnl_pct'] is not None else e['pnl_pct'],
+                                      reason=e['trigger'], price=e['exit_price'] or e['current_price'],
+                                      peak_pnl=e.get('trail_peak_pnl'))
                         print(f'     → 已标记为出场 ({e["trigger"]})')
                 else:
                     print(f'  ❌ {h["name"]}({h["code"]}) 推送失败: {msg}')
@@ -264,7 +289,10 @@ def main():
             print(f'  📝 Title: {payload["markdown"]["title"]}')
             mark_alerted(h['code'])
             if e['trigger'] in ('stop_loss', 'take_profit'):
-                close_holding(h['code'], e['pnl_pct'])
+                close_holding(h['code'],
+                              e['exit_pnl_pct'] if e['exit_pnl_pct'] is not None else e['pnl_pct'],
+                              reason=e['trigger'], price=e['exit_price'] or e['current_price'],
+                              peak_pnl=e.get('trail_peak_pnl'))
     else:
         print('\n✅ 持仓正常，无触发告警')
 
