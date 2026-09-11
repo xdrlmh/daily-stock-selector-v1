@@ -11,7 +11,7 @@ on:
         default: 'false'
 
 permissions:
-  contents: read
+  contents: write  # 需要回写 data/portfolio.json（持仓结算 + 自动补仓）
 
 jobs:
   review-push:
@@ -45,3 +45,16 @@ jobs:
           path: reports/主升浪复盘_*.md
           retention-days: 90
           if-no-files-found: warn
+
+      - name: 回写持仓池（止盈止损结算 + 自动补仓）
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/portfolio.json
+          if git diff --staged --quiet; then
+            echo "持仓池无变化，跳过提交"
+          else
+            git commit -m "chore: 持仓结算与补仓 $(date +'%Y-%m-%d %H:%M')"
+            git push
+          fi
