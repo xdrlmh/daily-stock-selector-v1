@@ -7,6 +7,7 @@ Tushare API 文档: https://tushare.pro/document/2
 需要环境变量: TUSHARE_TOKEN（在 GitHub Secrets 中配置）
 """
 import os
+import time
 import tushare as ts
 import pandas as pd
 from datetime import datetime, timedelta
@@ -31,13 +32,60 @@ def _init_tushare() -> Any:
 
 
 # ============ 工具函数 ============
+TS_RETRY_TIMES = 3         # 单次 Tushare 调用重试次数（应对网络抖动/限流）
+TS_RETRY_WAIT = 3          # 重试间隔基数（秒），第 n 次重试等待 n * TS_RETRY_WAIT
+MAX_FALLBACK_DAYS = 5      # 数据不可用时，最多向前回退的交易日数
+MIN_EXPECTED_ROWS = 1000   # 单日全市场行情的最小有效条数（低于此值视为异常/未发布）
+
+# 模块级缓存：本次运行统一使用的行情日期。
+# fetch_market_spot 回退后会把最终采用日期写进来，后续的
+# 资金流 / 大盘 / 复盘取数复用同一日期，避免各接口口径错位。
+_RESOLVED_TRADE_DATE: str = ''
+
+
+def _ts_call(func: Any, **kwargs) -> Any:
+    """带重试的 Tushare 调用；全部失败返回 None（不抛异常，由调用方决定降级策略）"""
+    last_err = None
+    for attempt in range(1, TS_RETRY_TIMES + 1):
+        try:
+            return func(**kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt < TS_RETRY_TIMES:
+                time.sleep(TS_RETRY_WAIT * attempt)
+    print(f'  ⚠️ Tushare 调用失败（已重试 {TS_RETRY_TIMES} 次）: {last_err}')
+    return None
+
+
+def _trading_days_desc(pro: Any, count: int = 70) -> List[str]:
+    """返回最近 count 个交易日，按日期倒序（下标 0 为最近一个交易日）"""
+    end = datetime.now()
+    start = end - timedelta(days=count * 2 + 40)
+    cal = _ts_call(
+        pro.trade_cal, exchange='SSE', is_open='1',
+        start_date=start.strftime('%Y%m%d'), end_date=end.strftime('%Y%m%d'),
+    )
+    if cal is None or cal.empty:
+        return []
+    return cal.sort_values('cal_date', ascending=False)['cal_date'].tolist()[:count]
+
+
 def _probe_published(pro: Any, trade_date: str) -> bool:
     """探查某个交易日的日线数据是否已经发布（Tushare 收盘后约 17:00-19:00 才更新）"""
-    try:
-        probe = pro.daily(trade_date=trade_date, fields='ts_code')
-    except Exception:
-        return False
+    probe = _ts_call(pro.daily, trade_date=trade_date, fields='ts_code')
     return probe is not None and not probe.empty
+
+
+def _find_anchor(pro: Any, all_dates: List[str], max_probe: int = MAX_FALLBACK_DAYS) -> int:
+    """从最近交易日向前探查，返回第一个「日线数据已发布」的索引；找不到时返回 0"""
+    for i in range(min(max_probe, len(all_dates))):
+        if _probe_published(pro, all_dates[i]):
+            if i > 0:
+                skipped = '、'.join(all_dates[:i])
+                print(f'  ⏮️ 跳过无数据/未发布的交易日 {skipped}，'
+                      f'回退到最近已发布交易日 {all_dates[i]}')
+            return i
+    return 0
 
 
 def _get_trade_dates(pro: Any, days_back_list: List[int]) -> Dict[int, str]:
@@ -46,43 +94,34 @@ def _get_trade_dates(pro: Any, days_back_list: List[int]) -> Dict[int, str]:
     ⚠️ 关键点：N=0 表示「最近一个日线数据『已发布』的交易日」，而不是日历上的最近交易日。
     Tushare 的日线数据要等收盘后（约 17:00-19:00）才更新，所以：
       - 早盘 08:35 运行时，当天数据还没有 → 必须回退到上一交易日
-      - 复盘若在 15:30 运行，当天数据同样没有 → 回退到上一交易日
+      - 复盘若在 18:30 运行，当天数据可能尚未就绪 → 同样回退到上一交易日
     否则会取到空数据，导致主流程 exit(1)。
     """
-    max_days = max(days_back_list) * 2 + 30
-    now = datetime.now()
-    cal = pro.trade_cal(
-        exchange='SSE', is_open='1',
-        start_date=(now - timedelta(days=max_days)).strftime('%Y%m%d'),
-        end_date=now.strftime('%Y%m%d'),
-    )
-    if cal is None or cal.empty:
+    need = max(days_back_list) + MAX_FALLBACK_DAYS + 5
+    all_dates = _trading_days_desc(pro, count=need)
+    if not all_dates:
         raise RuntimeError('未找到交易日历')
-    cal_sorted = cal.sort_values('cal_date', ascending=False).reset_index(drop=True)
-    all_dates = cal_sorted['cal_date'].tolist()
+    anchor = _find_anchor(pro, all_dates)
 
-    # 从最近交易日向前探查，跳过「数据尚未发布」的日期（最多回看 5 个交易日）
-    anchor = 0
-    for i in range(min(5, len(all_dates))):
-        if _probe_published(pro, all_dates[i]):
-            anchor = i
-            break
-    if anchor > 0:
-        print(f'  ⏮️ {all_dates[0]} 日线数据尚未发布，回退到最近已发布交易日 {all_dates[anchor]}')
+    # 若本次运行已由 fetch_market_spot 决议过日期（含回退），统一复用之
+    if _RESOLVED_TRADE_DATE and _RESOLVED_TRADE_DATE in all_dates:
+        anchor = all_dates.index(_RESOLVED_TRADE_DATE)
 
     usable = all_dates[anchor:]
     result = {}
     for n in days_back_list:
         if n < len(usable):
             result[n] = usable[n]
+    if not result:
+        raise RuntimeError('未找到可用的交易日（数据可能全部未发布）')
     return result
 
 
 def _get_stock_names(pro: Any) -> pd.DataFrame:
-    """获取全部上市股票代码-名称映射"""
-    basic = pro.stock_basic(
-        exchange='', list_status='L',
-        fields='ts_code,symbol,name,market'
+    """获取全部上市股票代码-名称映射（带重试）"""
+    basic = _ts_call(
+        pro.stock_basic, exchange='', list_status='L',
+        fields='ts_code,symbol,name,market',
     )
     return basic
 
@@ -90,43 +129,85 @@ def _get_stock_names(pro: Any) -> pd.DataFrame:
 # ============ 行情抓取 ============
 def fetch_market_spot() -> pd.DataFrame:
     """
-    获取全市场行情（基于最近交易日 EOD 数据）
-    字段：code, name, price, pct_change, pct_5d, pct_60d,
+    获取全市场行情（基于最近「数据已发布」交易日的 EOD 数据）
+
+    容错设计（针对 08:35 早盘场景：当日数据可能尚未发布，或临时读取失败）：
+    1. 从最近交易日向前探查，跳过「日线数据尚未发布」的日期；
+    2. 逐日构建行情；若某日构建失败或行情条数异常偏低（< MIN_EXPECTED_ROWS），
+       自动再向前回退一个交易日重试；
+    3. 最多回退 MAX_FALLBACK_DAYS 个交易日，全部失败才返回空 DataFrame。
+
+    字段：code, name, price, pct_change, pct_5d, pct_60d, open,
           turnover_rate, pe_ttm, pb, total_mcap, circ_mcap,
-          volume_ratio, volume, turnover, high, low, open, pre_close, change
+          volume_ratio, volume, turnover, high, low, pre_close, change
     """
     print('📡 抓取全市场行情（Tushare）...')
+    global _RESOLVED_TRADE_DATE
     try:
         pro = _init_tushare()
+    except Exception as e:
+        print(f'  ❌ Tushare 初始化失败: {e}')
+        return pd.DataFrame()
 
-        dates = _get_trade_dates(pro, [0, 5, 60])
-        today = dates[0]
-        d_5d = dates.get(5, today)
-        d_60d = dates.get(60, today)
-        print(f'  📅 最近交易日={today} | 5日前={d_5d} | 60日前={d_60d}')
+    all_dates = _trading_days_desc(pro, count=60 + MAX_FALLBACK_DAYS + 10)
+    if not all_dates:
+        print('  ❌ 未取得交易日历')
+        return pd.DataFrame()
 
-        # 1. 最近交易日日线行情
-        daily_today = pro.daily(trade_date=today)
+    anchor = _find_anchor(pro, all_dates)
+
+    for extra in range(0, MAX_FALLBACK_DAYS + 1):
+        idx = anchor + extra
+        if idx + 60 >= len(all_dates):
+            print('  ⚠️ 可用交易日不足 60 个，停止回退')
+            break
+
+        today, d_5d, d_60d = all_dates[idx], all_dates[idx + 5], all_dates[idx + 60]
+        if extra > 0:
+            print(f'  ⏮️ 回退 {extra} 个交易日，改用 {today} 数据（5日前={d_5d} | 60日前={d_60d}）')
+
+        df = _build_spot(pro, today, d_5d, d_60d)
+        got = 0 if df is None else len(df)
+        if got >= MIN_EXPECTED_ROWS:
+            print(f'  ✅ 行情就绪：{today}（{got} 条）')
+            _RESOLVED_TRADE_DATE = today
+            return df
+        print(f'  ⚠️ {today} 行情异常（{got} 条 < {MIN_EXPECTED_ROWS}），尝试回退前一交易日')
+
+    print('  ❌ 连续回退后仍无法取得有效行情')
+    return pd.DataFrame()
+
+
+def _build_spot(pro: Any, today: str, d_5d: str, d_60d: str) -> pd.DataFrame:
+    """构建指定交易日的全市场行情（供 fetch_market_spot 逐日回退重试）"""
+    try:
+        # 1. 当日日线行情
+        daily_today = _ts_call(pro.daily, trade_date=today)
         if daily_today is None or daily_today.empty:
-            print(f'  ⚠️ 当日无行情（{today}, 可能非交易日）')
+            print(f'  ⚠️ {today} 当日行情为空')
             return pd.DataFrame()
-        print(f'  ✅ 当日行情: {len(daily_today)} 条')
+        print(f'  ✅ {today} 当日行情: {len(daily_today)} 条')
 
         # 2. 当日估值基础
-        basic_today = pro.daily_basic(
-            trade_date=today,
-            fields='ts_code,trade_date,pe,pe_ttm,pb,total_mv,circ_mv,turnover_rate,volume_ratio'
+        basic_today = _ts_call(
+            pro.daily_basic, trade_date=today,
+            fields='ts_code,trade_date,pe,pe_ttm,pb,total_mv,circ_mv,turnover_rate,volume_ratio',
         )
-        print(f'  ✅ 当日估值: {len(basic_today)} 条')
+        if basic_today is None or basic_today.empty:
+            print(f'  ⚠️ {today} 估值数据为空')
+            return pd.DataFrame()
+        print(f'  ✅ {today} 当日估值: {len(basic_today)} 条')
 
         # 3. 股票名称映射
         stock_names = _get_stock_names(pro)
+        if stock_names is None or stock_names.empty:
+            print(f'  ⚠️ {today} 股票名称映射为空')
+            return pd.DataFrame()
         name_map = stock_names.set_index('ts_code')['name'].to_dict()
-        print(f'  ✅ 股票名称: {len(name_map)} 条')
 
         # 4. 5d / 60d 收盘价（用于算趋势涨幅）
         def _close_on(date_str: str, out_col: str) -> pd.DataFrame:
-            d = pro.daily(trade_date=date_str, fields='ts_code,close')
+            d = _ts_call(pro.daily, trade_date=date_str, fields='ts_code,close')
             if d is None or d.empty:
                 print(f'  ⚠️ {date_str} 无行情数据，{out_col} 记为空')
                 return pd.DataFrame(columns=['ts_code', out_col])
@@ -169,7 +250,7 @@ def fetch_market_spot() -> pd.DataFrame:
         print(f'  ✅ 共 {len(df)} 条记录')
         return df
     except Exception as e:
-        print(f'  ❌ 抓取行情失败: {e}')
+        print(f'  ❌ 构建 {today} 行情异常: {e}')
         import traceback
         traceback.print_exc()
         return pd.DataFrame()
@@ -185,7 +266,7 @@ def fetch_fund_flow_rank() -> pd.DataFrame:
         pro = _init_tushare()
         trade_date = _get_trade_dates(pro, [0])[0]
 
-        df = pro.moneyflow(trade_date=trade_date)
+        df = _ts_call(pro.moneyflow, trade_date=trade_date)
         if df is None or df.empty:
             print(f'  ⚠️ 资金流数据为空（{trade_date}）')
             return pd.DataFrame()
@@ -308,7 +389,7 @@ def fetch_market_overview() -> Dict[str, Any]:
         result['data_date'] = trade_date
 
         # 1. 上证指数当日行情
-        idx_today = pro.index_daily(ts_code='000001.SH', trade_date=trade_date)
+        idx_today = _ts_call(pro.index_daily, ts_code='000001.SH', trade_date=trade_date)
         if idx_today is not None and not idx_today.empty:
             row = idx_today.iloc[0]
             result['index_close'] = float(row['close'])
@@ -319,7 +400,10 @@ def fetch_market_overview() -> Dict[str, Any]:
 
         # 2. 上证指数60日 K线 → MA20/MA60 趋势判断
         start_date = (datetime.now() - timedelta(days=130)).strftime('%Y%m%d')
-        idx_hist = pro.index_daily(ts_code='000001.SH', start_date=start_date, end_date=trade_date)
+        idx_hist = _ts_call(
+            pro.index_daily, ts_code='000001.SH',
+            start_date=start_date, end_date=trade_date,
+        )
         if idx_hist is not None and len(idx_hist) >= 60:
             closes = idx_hist.sort_values('trade_date')['close'].astype(float).values
             closes = closes[-60:]  # 取最近60个交易日
@@ -350,7 +434,7 @@ def fetch_market_overview() -> Dict[str, Any]:
             print(f'  ⚠️ 上证指数60日数据不足（仅 {0 if idx_hist is None else len(idx_hist)} 条）')
 
         # 3. 全市场主力净额（moneyflow 大单合计）
-        mf = pro.moneyflow(trade_date=trade_date)
+        mf = _ts_call(pro.moneyflow, trade_date=trade_date)
         if mf is not None and not mf.empty:
             # buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount = 大单净额（万元）
             # 主力 = 大单 + 特大单
@@ -406,7 +490,7 @@ def fetch_market_review() -> Dict[str, Any]:
 
         # 1. 上证指数当日行情
         try:
-            idx_today = pro.index_daily(ts_code='000001.SH', trade_date=trade_date)
+            idx_today = _ts_call(pro.index_daily, ts_code='000001.SH', trade_date=trade_date)
             if idx_today is not None and not idx_today.empty:
                 row = idx_today.iloc[0]
                 result['index_close'] = float(row['close'])
@@ -420,7 +504,10 @@ def fetch_market_review() -> Dict[str, Any]:
         # 2. 上证指数60日 K线 → MA20/MA60 趋势判断
         try:
             start_date = (datetime.now() - timedelta(days=130)).strftime('%Y%m%d')
-            idx_hist = pro.index_daily(ts_code='000001.SH', start_date=start_date, end_date=trade_date)
+            idx_hist = _ts_call(
+                pro.index_daily, ts_code='000001.SH',
+                start_date=start_date, end_date=trade_date,
+            )
             if idx_hist is not None and len(idx_hist) >= 60:
                 closes = idx_hist.sort_values('trade_date')['close'].astype(float).values
                 closes = closes[-60:]
@@ -449,7 +536,7 @@ def fetch_market_review() -> Dict[str, Any]:
 
         # 3. 全市场主力净额（moneyflow 大单+特大单，单位万→亿）
         try:
-            mf = pro.moneyflow(trade_date=trade_date)
+            mf = _ts_call(pro.moneyflow, trade_date=trade_date)
             if mf is not None and not mf.empty:
                 big_net_wan = (
                     mf['buy_lg_amount'].fillna(0).sum()
@@ -466,7 +553,7 @@ def fetch_market_review() -> Dict[str, Any]:
 
         # 4. 全市场日线：成交额 + 涨跌停家数 + 涨跌家数
         try:
-            daily_today = pro.daily(trade_date=trade_date)
+            daily_today = _ts_call(pro.daily, trade_date=trade_date)
             if daily_today is not None and not daily_today.empty:
                 # 成交额：Tushare daily 的 amount 单位为千元 → 元×1000 → 亿/1e5
                 result['amount_yi'] = daily_today['amount'].sum() / 1e5
