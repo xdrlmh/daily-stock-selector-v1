@@ -9,6 +9,10 @@ on:
         description: '仅测试推送，不做实际选股'
         required: false
         default: 'false'
+      fuse_drop_pct:
+        description: '应急/测试用：临时覆盖大盘熔断阈值（%，留空=默认 -2）'
+        required: false
+        default: ''
 
 permissions:
   contents: write  # 需要回写 data/portfolio.json（持仓结算 + 自动补仓）
@@ -35,6 +39,7 @@ jobs:
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           TEST_ONLY: ${{ github.event.inputs.test_only }}
+          MARKET_FUSE_DROP_PCT: ${{ github.event.inputs.fuse_drop_pct }}
         run: python main_review.py
 
       - name: 上传当日复盘报告（历史追溯）
