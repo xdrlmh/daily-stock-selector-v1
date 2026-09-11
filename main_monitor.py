@@ -12,10 +12,12 @@
 - 止损：盈亏 ≤ stop_loss_pct（默认 -7%）
 - 移动止盈：盈利首次 ≥ +15% 启动；启动后峰值回撤 8% 即卖出
   （峰值用盘中最高价，触发用盘中最低价）
+- 时间止损：僵尸股（≥8 交易日且期间最高涨幅 <3%）/ 低效股（≥15 交易日且 <5%）
 - 警戒：盈利 ≥ +10%（接近启动线，给个温和提醒）
 
 ⚠️ 常规止盈止损已合并到盘后复盘（main_review.py，18:30）。
    本脚本仅供盘中应急/调试手动触发，已取消定时调度。
+   注：交易日钟（days_held）由盘后复盘推进，本脚本按当前计数评估、不做推进。
 """
 import os
 import sys
@@ -29,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.portfolio import (
     get_active_holdings, mark_alerted, close_holding,
     evaluate_holding, update_trail_states, WARNING_PROFIT_PCT,
+    TIME_STOP_REASONS, ZOMBIE_DAYS, ZOMBIE_PEAK_PCT,
+    INEFFICIENT_DAYS, INEFFICIENT_PEAK_PCT,
 )
 from src.data_fetcher import _init_tushare
 from src.dingtalk import push_to_dingtalk
@@ -129,6 +133,24 @@ def build_alert_message(holding: Dict, evaluation: Dict, current_price: float) -
         title_emoji = '⚡'
         status_text = f'**接近移动止盈启动线（+{pnl_pct}%）**'
         advice = f'💡 距启动线 +{activate_pct}% 还差 {evaluation.get("distance_to_take_profit", 0):.2f}%，可提前规划'
+    elif trigger in TIME_STOP_REASONS:
+        days = evaluation.get('days_held')
+        peak_pnl = evaluation.get('peak_high_pnl')
+        peak_txt = f'{peak_pnl:+.2f}%' if peak_pnl is not None else '-'
+        if trigger == 'time_stop_zombie':
+            emoji = '🧟'
+            title_emoji = '🧟'
+            status_text = (f'**时间止损 · 僵尸股清理**（持有 {days} 交易日，'
+                           f'期间最高仅 {peak_txt}，未达 {ZOMBIE_PEAK_PCT}%）')
+            advice = (f'💡 该股持有 {ZOMBIE_DAYS} 个交易日仍未有效波动，判定为僵尸股，'
+                      f'建议清仓、把仓位让给新的主升浪标的')
+        else:
+            emoji = '🐌'
+            title_emoji = '🐌'
+            status_text = (f'**时间止损 · 低效股清理**（持有 {days} 交易日，'
+                           f'期间最高仅 {peak_txt}，未达 {INEFFICIENT_PEAK_PCT}%）')
+            advice = (f'💡 该股持有 {INEFFICIENT_DAYS} 个交易日仍未启动移动止盈，'
+                      f'判定为低效股，建议清仓换股')
     else:
         # 正常状态，不应该推送（除非是 summary）
         return None
@@ -188,8 +210,14 @@ def build_summary_message(holdings: List[Dict], evaluations: List[Dict]) -> Dict
             status = '🚨 止损'
         elif e['trigger'] == 'take_profit':
             status = '🔒 移动止盈卖出'
+        elif e['trigger'] == 'time_stop_zombie':
+            status = '🧟 僵尸股清理'
+        elif e['trigger'] == 'time_stop_inefficient':
+            status = '🐌 低效股清理'
         elif e.get('trail_active'):
             status = f"🔒 移动止盈中(峰{e.get('trail_peak_pnl', 0):+.0f}%)"
+        elif e.get('time_stop_hint'):
+            status = e['time_stop_hint']
         elif e['trigger'] == 'warning':
             status = '⚡ 接近启动'
         else:
@@ -212,6 +240,24 @@ def build_summary_message(holdings: List[Dict], evaluations: List[Dict]) -> Dict
             'text': text
         }
     }
+
+
+EXIT_TRIGGERS = ('stop_loss', 'take_profit') + TIME_STOP_REASONS
+
+
+def _exit_peak(e: Dict):
+    """平仓时的峰值口径：移动止盈用 trail 峰值，其余（止损/时间止损）用期间最高涨幅"""
+    return e.get('trail_peak_pnl') if e.get('trigger') == 'take_profit' else e.get('peak_high_pnl')
+
+
+def _close_from_trigger(holding: Dict, e: Dict) -> None:
+    """按触发结果平仓（止损 / 移动止盈 / 时间止损）"""
+    close_holding(holding['code'],
+                  e['exit_pnl_pct'] if e['exit_pnl_pct'] is not None else e['pnl_pct'],
+                  reason=e['trigger'],
+                  price=e['exit_price'] or e.get('current_price'),
+                  peak_pnl=_exit_peak(e),
+                  days_held=e.get('days_held'))
 
 
 def main():
@@ -253,7 +299,8 @@ def main():
                               'trail_high': eval_result['trail_high']})
 
         # 检查是否需要告警（且未告警过）
-        if eval_result['trigger'] in ('stop_loss', 'take_profit', 'warning') and not h.get('alerted'):
+        if (eval_result['trigger'] in ('stop_loss', 'take_profit', 'warning')
+                or eval_result['trigger'] in TIME_STOP_REASONS) and not h.get('alerted'):
             payload = build_alert_message(h, eval_result, info['price'])
             if payload:
                 alerts.append((h, eval_result, payload))
@@ -273,10 +320,8 @@ def main():
                     print(f'  ✅ {h["name"]}({h["code"]}) 告警已推送')
                     # 推送成功后更新状态
                     mark_alerted(h['code'])
-                    if e['trigger'] in ('stop_loss', 'take_profit'):
-                        close_holding(h['code'], e['exit_pnl_pct'] if e['exit_pnl_pct'] is not None else e['pnl_pct'],
-                                      reason=e['trigger'], price=e['exit_price'] or e['current_price'],
-                                      peak_pnl=e.get('trail_peak_pnl'))
+                    if e['trigger'] in EXIT_TRIGGERS:
+                        _close_from_trigger(h, e)
                         print(f'     → 已标记为出场 ({e["trigger"]})')
                 else:
                     print(f'  ❌ {h["name"]}({h["code"]}) 推送失败: {msg}')
@@ -288,11 +333,8 @@ def main():
             print(f'  📋 {h["name"]}({h["code"]}) trigger={e["trigger"]} pnl={e["pnl_pct"]:+.2f}%')
             print(f'  📝 Title: {payload["markdown"]["title"]}')
             mark_alerted(h['code'])
-            if e['trigger'] in ('stop_loss', 'take_profit'):
-                close_holding(h['code'],
-                              e['exit_pnl_pct'] if e['exit_pnl_pct'] is not None else e['pnl_pct'],
-                              reason=e['trigger'], price=e['exit_price'] or e['current_price'],
-                              peak_pnl=e.get('trail_peak_pnl'))
+            if e['trigger'] in EXIT_TRIGGERS:
+                _close_from_trigger(h, e)
     else:
         print('\n✅ 持仓正常，无触发告警')
 
