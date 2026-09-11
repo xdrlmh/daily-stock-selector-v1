@@ -12,7 +12,9 @@
 - 止损：盈亏 ≤ stop_loss_pct（默认 -7%）
 - 移动止盈：盈利首次 ≥ +15% 启动；启动后峰值回撤 8% 即卖出
   （峰值用盘中最高价，触发用盘中最低价）
-- 时间止损：僵尸股（≥5 交易日且期间最高涨幅 <3%）/ 低效股（≥10 交易日且 <5%）
+- 时间止损：僵尸股（≥8 交易日且期间最高涨幅 <3%）/ 低效股（≥15 交易日且 <5%）
+  （⚠️ 时间止损盘中**只告警、不平仓** —— 它属于「主动换仓」，统一由盘后复盘执行，
+    这样才能配套自动补仓，并接受大盘弱势熔断的约束）
 - 警戒：盈利 ≥ +10%（接近启动线，给个温和提醒）
 
 ⚠️ 常规止盈止损已合并到盘后复盘（main_review.py，18:30）。
@@ -143,14 +145,16 @@ def build_alert_message(holding: Dict, evaluation: Dict, current_price: float) -
             status_text = (f'**时间止损 · 僵尸股清理**（持有 {days} 交易日，'
                            f'期间最高仅 {peak_txt}，未达 {ZOMBIE_PEAK_PCT}%）')
             advice = (f'💡 该股持有 {ZOMBIE_DAYS} 个交易日仍未有效波动，判定为僵尸股，'
-                      f'建议清仓、把仓位让给新的主升浪标的')
+                      f'建议清仓、把仓位让给新的主升浪标的'
+                      f'（盘中仅提示，实际清理由盘后复盘统一执行）')
         else:
             emoji = '🐌'
             title_emoji = '🐌'
             status_text = (f'**时间止损 · 低效股清理**（持有 {days} 交易日，'
                            f'期间最高仅 {peak_txt}，未达 {INEFFICIENT_PEAK_PCT}%）')
             advice = (f'💡 该股持有 {INEFFICIENT_DAYS} 个交易日仍未启动移动止盈，'
-                      f'判定为低效股，建议清仓换股')
+                      f'判定为低效股，建议清仓换股'
+                      f'（盘中仅提示，实际清理由盘后复盘统一执行）')
     else:
         # 正常状态，不应该推送（除非是 summary）
         return None
@@ -242,7 +246,10 @@ def build_summary_message(holdings: List[Dict], evaluations: List[Dict]) -> Dict
     }
 
 
-EXIT_TRIGGERS = ('stop_loss', 'take_profit') + TIME_STOP_REASONS
+# 盘中只执行「保护性出场」（止损 / 移动止盈，属硬纪律）；
+# 时间止损是「主动换仓」，统一交给盘后复盘执行 —— 那里才能用当日强势股补位，
+# 也能被大盘弱势熔断拦下，避免盘中清仓后半个交易日空仓。
+EXIT_TRIGGERS = ('stop_loss', 'take_profit')
 
 
 def _exit_peak(e: Dict):
