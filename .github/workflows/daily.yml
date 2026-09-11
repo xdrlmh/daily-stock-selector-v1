@@ -56,6 +56,7 @@ jobs:
             echo "持仓池无变化，跳过提交"
           else
             git commit -m "chore: 更新持仓池(选股TOP3) $(date +'%Y-%m-%d %H:%M')"
+            git pull --rebase --autostash origin main
             git push
           fi
 
