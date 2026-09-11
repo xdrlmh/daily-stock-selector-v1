@@ -2,7 +2,7 @@ name: 主升浪盘后复盘
 
 on:
   schedule:
-    - cron: '30 7 * * 1-5'  # 北京时间 15:30（收盘后 30 分钟），与早盘 08:15 互补
+    - cron: '30 10 * * 1-5'  # 北京时间 18:30（Tushare 当日数据约 17:00+ 才发布，需等数据就绪）
   workflow_dispatch:
     inputs:
       test_only:

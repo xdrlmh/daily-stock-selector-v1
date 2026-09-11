@@ -31,21 +31,50 @@ def _init_tushare() -> Any:
 
 
 # ============ 工具函数 ============
+def _probe_published(pro: Any, trade_date: str) -> bool:
+    """探查某个交易日的日线数据是否已经发布（Tushare 收盘后约 17:00-19:00 才更新）"""
+    try:
+        probe = pro.daily(trade_date=trade_date, fields='ts_code')
+    except Exception:
+        return False
+    return probe is not None and not probe.empty
+
+
 def _get_trade_dates(pro: Any, days_back_list: List[int]) -> Dict[int, str]:
-    """获取 N 个交易日前的日期，返回 {N: 'YYYYMMDD'}，N=0 为最近交易日"""
+    """获取 N 个交易日前的日期，返回 {N: 'YYYYMMDD'}
+
+    ⚠️ 关键点：N=0 表示「最近一个日线数据『已发布』的交易日」，而不是日历上的最近交易日。
+    Tushare 的日线数据要等收盘后（约 17:00-19:00）才更新，所以：
+      - 早盘 08:35 运行时，当天数据还没有 → 必须回退到上一交易日
+      - 复盘若在 15:30 运行，当天数据同样没有 → 回退到上一交易日
+    否则会取到空数据，导致主流程 exit(1)。
+    """
     max_days = max(days_back_list) * 2 + 30
+    now = datetime.now()
     cal = pro.trade_cal(
         exchange='SSE', is_open='1',
-        start_date=(datetime.now() - timedelta(days=max_days)).strftime('%Y%m%d'),
-        end_date=datetime.now().strftime('%Y%m%d'),
+        start_date=(now - timedelta(days=max_days)).strftime('%Y%m%d'),
+        end_date=now.strftime('%Y%m%d'),
     )
     if cal is None or cal.empty:
         raise RuntimeError('未找到交易日历')
     cal_sorted = cal.sort_values('cal_date', ascending=False).reset_index(drop=True)
+    all_dates = cal_sorted['cal_date'].tolist()
+
+    # 从最近交易日向前探查，跳过「数据尚未发布」的日期（最多回看 5 个交易日）
+    anchor = 0
+    for i in range(min(5, len(all_dates))):
+        if _probe_published(pro, all_dates[i]):
+            anchor = i
+            break
+    if anchor > 0:
+        print(f'  ⏮️ {all_dates[0]} 日线数据尚未发布，回退到最近已发布交易日 {all_dates[anchor]}')
+
+    usable = all_dates[anchor:]
     result = {}
     for n in days_back_list:
-        if n < len(cal_sorted):
-            result[n] = cal_sorted.iloc[n]['cal_date']
+        if n < len(usable):
+            result[n] = usable[n]
     return result
 
 
@@ -96,10 +125,15 @@ def fetch_market_spot() -> pd.DataFrame:
         print(f'  ✅ 股票名称: {len(name_map)} 条')
 
         # 4. 5d / 60d 收盘价（用于算趋势涨幅）
-        daily_5d = pro.daily(trade_date=d_5d)[['ts_code', 'close']].rename(
-            columns={'close': 'close_5d'})
-        daily_60d = pro.daily(trade_date=d_60d)[['ts_code', 'close']].rename(
-            columns={'close': 'close_60d'})
+        def _close_on(date_str: str, out_col: str) -> pd.DataFrame:
+            d = pro.daily(trade_date=date_str, fields='ts_code,close')
+            if d is None or d.empty:
+                print(f'  ⚠️ {date_str} 无行情数据，{out_col} 记为空')
+                return pd.DataFrame(columns=['ts_code', out_col])
+            return d[['ts_code', 'close']].rename(columns={'close': out_col})
+
+        daily_5d = _close_on(d_5d, 'close_5d')
+        daily_60d = _close_on(d_60d, 'close_60d')
 
         # 5. 合并 + 算涨幅
         df = daily_today.merge(basic_today, on=['ts_code', 'trade_date'], how='left')

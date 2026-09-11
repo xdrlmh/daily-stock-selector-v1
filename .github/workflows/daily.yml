@@ -2,7 +2,7 @@ name: 主升浪日报推送
 
 on:
   schedule:
-    - cron: '15 0 * * 1-5'  # 北京时间 08:15（开盘前 30 分钟），比之前提前 30 分钟
+    - cron: '35 0 * * 1-5'  # 北京时间 08:35（开盘前约 55 分钟）
   workflow_dispatch:
     inputs:
       test_only:
@@ -11,7 +11,7 @@ on:
         default: 'false'
 
 permissions:
-  contents: read
+  contents: write  # 需要回写 data/portfolio.json（TOP 3 监控名单）
 
 jobs:
   stock-push:
@@ -45,4 +45,17 @@ jobs:
           path: reports/主升浪精选_*.md
           retention-days: 90
           if-no-files-found: warn
+
+      - name: 回写持仓池（TOP 3 监控名单）
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/portfolio.json
+          if git diff --staged --quiet; then
+            echo "持仓池无变化，跳过提交"
+          else
+            git commit -m "chore: 更新持仓池(选股TOP3) $(date +'%Y-%m-%d %H:%M')"
+            git push
+          fi
 

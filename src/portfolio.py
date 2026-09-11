@@ -128,7 +128,7 @@ def add_top3_from_screening(candidates_df) -> int:
         result = add_to_portfolio(
             code=row['code'],
             name=row['name'],
-            buy_price=row.get('close', 0),
+            buy_price=row.get('price', row.get('close', 0)),
         )
         if result:
             added += 1
