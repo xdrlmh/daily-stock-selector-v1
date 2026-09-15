@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   stock-push:
-    name: 主升浪选股并推送到钉钉
+    name: 主升浪选股并推送
     runs-on: ubuntu-latest
     steps:
       - name: 拉取代码
@@ -33,6 +33,8 @@ jobs:
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           TEST_ONLY: ${{ github.event.inputs.test_only }}
         run: python main.py
