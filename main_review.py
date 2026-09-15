@@ -32,7 +32,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import DINGTALK_WEBHOOK, DINGTALK_SECRET, TEST_ONLY, REPORTS_DIR, validate_config
+from src.config import TEST_ONLY, REPORTS_DIR, validate_config
 from src.data_fetcher import (
     fetch_market_spot, fetch_fund_flow_rank,
     filter_main_board, enrich_with_fund_flow,
@@ -40,7 +40,7 @@ from src.data_fetcher import (
 )
 from src.selector import screen_stocks, analyze_sector_heat
 from src.report import generate_review_payload, save_review_report
-from src.dingtalk import push_to_dingtalk
+from src.notifier import push_all, summarize
 from src.portfolio import (
     MAX_HOLDINGS, DEFAULT_STOP_LOSS_PCT,
     TRAIL_ACTIVATE_PCT, TRAIL_DRAWDOWN_PCT,
@@ -308,7 +308,7 @@ def main():
     )
     log.info(f'复盘报告已保存：{report_path}')
 
-    # 10. 推钉钉
+    # 10. 推送（钉钉 + 飞书 双通道，未配置的通道自动跳过）
     if TEST_ONLY:
         log.info('TEST_ONLY 模式，仅打印推送内容，不实际推送')
         print('\n--- [TEST_ONLY] 复盘推送预览 ---')
@@ -316,11 +316,10 @@ def main():
         print(payload['markdown']['text'])
         print('--- END ---\n')
     else:
-        success, msg = push_to_dingtalk(DINGTALK_WEBHOOK, payload, DINGTALK_SECRET)
-        if success:
-            log.info(f'✅ 钉钉复盘推送成功：{msg}')
-        else:
-            log.error(f'❌ 钉钉复盘推送失败：{msg}')
+        results = push_all(payload, log=log)
+        log.info(f'📤 推送结果：{summarize(results)}')
+        if not any(ok for ok, _ in results.values()):
+            log.error('❌ 所有通道推送均失败，请检查 webhook 配置')
 
     # 11. 控制台小结
     print('\n' + '=' * 60)
