@@ -461,12 +461,44 @@ def generate_outlook(market: Dict[str, Any], sector_heat: List[Dict]) -> List[st
             lines.append(f'- 主力资金**大幅流出**（{main_yi:+.0f}亿），谨防踩踏')
 
     # 3) 板块温度头部
+    # ⚠️ sector_heat 按「强度分」排序（= 平均涨幅*0.4 + 主力流入*0.3 + 涨停数*0.3），
+    #    并不等价于「资金净流入方向」。若无条件写"资金聚焦 X"，会出现
+    #    X 实际主力净流出却被描述成资金流入的误导（2026-09-15 用户截图暴露：
+    #    半导体 温度第 1，但主力 -18.3 亿）。故按 top 的资金方向分三种措辞。
     if sector_heat:
         top = sector_heat[0]
-        lines.append(
-            f'- 资金聚焦 **{top["theme"]}**（平均涨幅 {top["avg_pct"]:+.1f}%），'
-            f'明日可优先跟踪该板块的**龙头分歧转一致**机会'
-        )
+        top_theme = top.get('theme', '未知')
+        top_yi = safe_float(top.get('inflow_yi'))
+        top_pct = safe_float(top.get('avg_pct'))
+        pct_txt = f'{top_pct:+.1f}%' if top_pct is not None else '-'
+        if top_yi is None:
+            lines.append(
+                f'- **{top_theme}** 板块温度居首（平均涨幅 {pct_txt}），'
+                f'明日可优先跟踪该板块的**龙头分歧转一致**机会'
+            )
+        elif top_yi > 0:
+            lines.append(
+                f'- 资金聚焦 **{top_theme}**（平均涨幅 {pct_txt}，主力 {top_yi:+.1f}亿），'
+                f'明日可优先跟踪该板块的**龙头分歧转一致**机会'
+            )
+        else:
+            lines.append(
+                f'- **{top_theme}** 板块温度居首（平均涨幅 {pct_txt}），'
+                f'但主力**净流出 {abs(top_yi):.1f}亿** → 情绪强于资金，追高需谨慎'
+            )
+            # 温度第一 ≠ 资金第一：若另有板块资金真在流入，点明真正的资金去向
+            inflow_best = max(
+                (s for s in sector_heat
+                 if (safe_float(s.get('inflow_yi')) or 0) > 0),
+                key=lambda s: safe_float(s.get('inflow_yi')) or 0,
+                default=None,
+            )
+            if inflow_best is not None and inflow_best.get('theme') != top_theme:
+                by = safe_float(inflow_best.get('inflow_yi')) or 0
+                lines.append(
+                    f'- 资金实际流入方向是 **{inflow_best.get("theme", "未知")}**'
+                    f'（主力 {by:+.1f}亿），可对比跟踪'
+                )
 
     # 4) 风险提示
     if main_yi is not None and main_yi < -50:
@@ -792,6 +824,9 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
                 f'- {medal} **{sector["theme"]}** - {emoji_up}平均涨幅 {sector["avg_pct"]:+.1f}% ｜ '
                 f'主力 {sector["inflow_yi"]:+.1f}亿 ｜ 涨停 {sector["limit_up"]}只'
             )
+        # 排序口径透明化：否则用户会疑惑"为什么下跌的板块排在上涨的前面"
+        lines.append('')
+        lines.append('> 排序口径：板块强度 = 平均涨幅×0.4 + 主力净流入×0.3 + 涨停数×0.3')
         lines.append('')
 
     # ---- 明日展望 ----
@@ -1020,10 +1055,15 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
         lines.append('')
         for i, sector in enumerate(sector_heat, 1):
             medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
+            # A 股惯例配色，与推送版保持一致
             lines.append(
-                f'- {medal} **{sector["theme"]}** - 平均涨幅 {sector["avg_pct"]:+.1f}% ｜ '
-                f'主力 {sector["inflow_yi"]:+.1f}亿 ｜ 涨停 {sector["limit_up"]}只'
+                f'- {medal} **{sector["theme"]}** - {pct_color(sector.get("avg_pct"))}'
+                f'平均涨幅 {format_num(sector.get("avg_pct"), "+.1f", "%")} ｜ '
+                f'主力 {format_num(sector.get("inflow_yi"), "+.1f", "亿")} ｜ '
+                f'涨停 {sector.get("limit_up", 0)}只'
             )
+        lines.append('')
+        lines.append('> 排序口径：板块强度 = 平均涨幅×0.4 + 主力净流入×0.3 + 涨停数×0.3')
         lines.append('')
 
     # 明日展望
