@@ -184,6 +184,17 @@ def _make_column_set(cells: List[str], weights: List[int],
     }
 
 
+def _bold_cell(c) -> str:
+    """表头单元格加粗。
+
+    必须先剥掉单元格里已有的 ** 包裹，否则 `**60日**` 会被二次加粗成
+    `****60日****`，在飞书里会渲染成带星号的乱码。
+    列合并后还会出现 `**60日**/主力净额` 这种混合串，所以用整体替换而不是首尾判断。
+    """
+    s = str(c or '').replace('**', '').strip()
+    return f'**{s}**' if s else ' '
+
+
 def _table_to_elements(header: Optional[List[str]],
                        data: List[List[str]]) -> List[Dict]:
     """表格 → 一组 column_set 元素（表头灰底加粗 + 数据行交替斑马纹）"""
@@ -193,7 +204,7 @@ def _table_to_elements(header: Optional[List[str]],
     weights = _col_weights(header, data)
 
     elements = [_make_column_set(
-        [f'**{c}**' if c else ' ' for c in header], weights, 'grey')]
+        [_bold_cell(c) for c in header], weights, 'grey')]
     for idx, row in enumerate(data):
         bg = 'default' if idx % 2 == 0 else 'grey'
         elements.append(_make_column_set(
