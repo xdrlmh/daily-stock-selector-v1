@@ -394,8 +394,9 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
         limit_count = len(all_stocks[all_stocks['pct_change'] >= 9.5])
         if limit_count > 0:
             lines.append(f'- 涨停家数：**{limit_count}**')
-        # 平均换手
-        avg_turnover = all_stocks['turnover_rate'].mean()
+        # 平均换手（可选展示项：缺列时降级跳过，不让整条推送失败）
+        avg_turnover = (all_stocks['turnover_rate'].mean()
+                        if 'turnover_rate' in all_stocks.columns else float('nan'))
         if not pd.isna(avg_turnover):
             lines.append(f'- 市场平均换手：{avg_turnover:.2f}%')
         lines.append('')
