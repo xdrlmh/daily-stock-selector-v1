@@ -196,8 +196,8 @@ md = """# 🎯 主升浪精选日报 2026-09-15
 card = fs.markdown_to_feishu_card(md, '📊 主升浪精选 2026-09-15')
 
 check('卡片有 header', 'header' in card)
-check('卡片标题正确',
-      card['header']['title']['content'] == '📊 主升浪精选 2026-09-15',
+check('卡片标题＝正文一级标题（避免与 header 重复）',
+      card['header']['title']['content'] == '🎯 主升浪精选日报 2026-09-15',
       card['header']['title'])
 check('标题栏为 plain_text', card['header']['title']['tag'] == 'plain_text')
 check('开启宽屏模式', card['config']['wide_screen_mode'] is True)
@@ -207,7 +207,7 @@ check('主题色自动识别「精选」→ blue',
 texts = [e.get('content', '') for e in card['elements'] if e['tag'] == 'markdown']
 joined = '\n'.join(texts)
 check('## 二级标题转加粗行', '**📊 大盘环境**' in joined)
-check('# 一级标题转加粗（不残留 #）', '**🎯 主升浪精选日报 2026-09-15**' in joined)
+check('# 一级标题已提升为标题栏（正文不重复）', '主升浪精选日报' not in joined)
 check('引用块去掉 > 前缀', '📡 数据源：Tushare' in joined and '> 📡' not in joined)
 check('列表项转 • 前缀', '• **🥇 贵州茅台**' in joined)
 check('表格已转 column_set（不在 markdown 里残留）',
@@ -447,6 +447,35 @@ try:
           len(fs._split_card(ecard)))
 except ImportError as e:
     print(f'  ⚠️ 跳过（缺 pandas）：{e}')
+
+# ======================================================================
+section('[9] A 股配色惯例 + 表格短列并排（2026-09-15 修复）')
+# ======================================================================
+
+from src import report as rp
+
+check('涨 +0.5% → 🔴（红涨）', rp.pct_color(0.5) == '🔴', rp.pct_color(0.5))
+check('跌 -0.6% → 🟢（绿跌）', rp.pct_color(-0.6) == '🟢', rp.pct_color(-0.6))
+check('零 → 🔴', rp.pct_color(0) == '🔴')
+check('None → ⚪（不误染）', rp.pct_color(None) == '⚪')
+check('NaN → ⚪（不误染）', rp.pct_color(float('nan')) == '⚪')
+check('非数字 → ⚪', rp.pct_color('abc') == '⚪')
+
+check('短列并排：序号 + 代码 → "1 600104"',
+      fs._join_cells('1', '600104') == '1 600104', fs._join_cells('1', '600104'))
+check('常规两列仍上下叠放',
+      fs._join_cells('2日', '11.73') == '2日\n11.73', fs._join_cells('2日', '11.73'))
+check('短列在右侧同样并排',
+      fs._join_cells('600519', '股') == '600519 股', fs._join_cells('600519', '股'))
+check('空值不产生多余空格', fs._join_cells('', 'x') == 'x')
+
+_pc = fs.markdown_to_feishu_card('# 一级标题\n\n## 二级\n\n正文', '旧标题')
+check('一级标题提升为卡片标题',
+      _pc['header']['title']['content'] == '一级标题', _pc['header']['title']['content'])
+check('正文不再重复一级标题',
+      not any('一级标题' in e.get('content', '') for e in _pc['elements']))
+check('二级标题仍保留加粗行',
+      any('**二级**' in e.get('content', '') for e in _pc['elements']))
 
 # ======================================================================
 print(f'\n{"=" * 64}')
