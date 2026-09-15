@@ -37,8 +37,8 @@ from src.portfolio import (
     INEFFICIENT_DAYS, INEFFICIENT_PEAK_PCT,
 )
 from src.data_fetcher import _init_tushare
-from src.dingtalk import push_to_dingtalk
-from src.config import DINGTALK_WEBHOOK, DINGTALK_SECRET, TEST_ONLY
+from src.notifier import push_all
+from src.config import TEST_ONLY
 
 
 # 说明：本脚本为「手动触发」的盘中监控工具。
@@ -315,23 +315,25 @@ def main():
     # 落盘移动止盈状态（峰值抬升 / 新启动）
     update_trail_states(trail_updates)
 
-    # 推送告警（每个持仓单独推送）
+    # 推送告警（每个持仓单独推送，钉钉 + 飞书 双通道）
     if alerts and not TEST_ONLY:
         print(f'\n📤 准备推送 {len(alerts)} 条告警...')
-        webhook = DINGTALK_WEBHOOK
-        secret = DINGTALK_SECRET
         for h, e, payload in alerts:
             try:
-                ok, msg = push_to_dingtalk(webhook, payload, secret)
-                if ok:
-                    print(f'  ✅ {h["name"]}({h["code"]}) 告警已推送')
+                results = push_all(payload)
+                detail = ' '.join(
+                    ('✅' if ok else '❌') + ch for ch, (ok, _) in results.items())
+                if any(ok for ok, _ in results.values()):
+                    print(f'  ✅ {h["name"]}({h["code"]}) 告警已推送 [{detail}]')
                     # 推送成功后更新状态
                     mark_alerted(h['code'])
                     if e['trigger'] in EXIT_TRIGGERS:
                         _close_from_trigger(h, e)
                         print(f'     → 已标记为出场 ({e["trigger"]})')
                 else:
-                    print(f'  ❌ {h["name"]}({h["code"]}) 推送失败: {msg}')
+                    errs = '; '.join(
+                        f'{ch}: {msg}' for ch, (ok, msg) in results.items() if not ok)
+                    print(f'  ❌ {h["name"]}({h["code"]}) 推送失败: {errs}')
             except Exception as ex:
                 print(f'  ❌ 推送异常: {ex}')
     elif alerts and TEST_ONLY:
