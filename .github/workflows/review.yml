@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   review-push:
-    name: 主升浪盘后复盘并推送到钉钉
+    name: 主升浪盘后复盘并推送
     runs-on: ubuntu-latest
     steps:
       - name: 拉取代码
@@ -37,6 +37,8 @@ jobs:
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           TEST_ONLY: ${{ github.event.inputs.test_only }}
           MARKET_FUSE_DROP_PCT: ${{ github.event.inputs.fuse_drop_pct }}
