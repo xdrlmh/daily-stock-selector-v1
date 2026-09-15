@@ -122,10 +122,27 @@ def _parse_markdown_table(block: List[str]) -> Tuple[Optional[List[str]], List[L
     return header, data
 
 
+def _join_cells(a: str, b: str, short_width: int = 2) -> str:
+    """合并两列的单元格内容。
+
+    若其中一列内容极短（如序号 `1`），用空格并排 —— 否则「1」会单独占一行，
+    使该列行数比邻列多，垂直居中后整行视觉错位（曾导致持仓表看起来"数字飘着"）。
+    其余情况上下叠放，保留原列顺序，信息不丢。
+    """
+    a, b = (a or '').strip(), (b or '').strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    if _display_width(a) <= short_width or _display_width(b) <= short_width:
+        return f'{a} {b}'
+    return f'{a}\n{b}'
+
+
 def _shrink_columns(header: List[str], data: List[List[str]],
                     max_cols: int = FEISHU_MAX_COLUMNS
                     ) -> Tuple[List[str], List[List[str]]]:
-    """列数超过飞书上限时，反复合并「最窄的相邻两列」（上下叠放，不丢信息）"""
+    """列数超过飞书上限时，反复合并「最窄的相邻两列」（叠放 / 并排，不丢信息）"""
     if not header:
         return header, data
     guard = 0
@@ -142,7 +159,7 @@ def _shrink_columns(header: List[str], data: List[List[str]],
                 best_i, best_w = i, w
         a, b = best_i, best_i + 1
         header = header[:a] + [f'{header[a]}/{header[b]}'] + header[b + 1:]
-        data = [r[:a] + [f'{r[a]}\n{r[b]}'.strip()] + r[b + 1:] for r in data]
+        data = [r[:a] + [_join_cells(r[a], r[b])] + r[b + 1:] for r in data]
     return header, data
 
 
@@ -237,6 +254,21 @@ def markdown_to_feishu_card(text: str, title: str,
             buf.clear()
 
     lines = (text or '').split('\n')
+
+    # 正文首个一级标题 → 升级为卡片标题栏文字。
+    # 否则会与 header 标题重复（如 header「📊 主升浪复盘」+ 正文「📊 主升浪盘后复盘」）。
+    card_title = title
+    pending_h1 = False
+    for _l in lines:
+        _s = _l.strip()
+        if not _s:
+            continue
+        _m = re.match(r'^#\s+(.*)$', _s)
+        if _m:
+            card_title = _m.group(1).strip()
+            pending_h1 = True
+        break
+
     i = 0
     while i < len(lines):
         raw = lines[i]
@@ -264,6 +296,11 @@ def markdown_to_feishu_card(text: str, title: str,
         m = re.match(r'^(#{1,6})\s+(.*)$', s)
         if m:
             flush()
+            if pending_h1 and len(m.group(1)) == 1:
+                # 已提升为卡片标题栏，正文不再重复显示
+                pending_h1 = False
+                i += 1
+                continue
             elements.append({'tag': 'markdown',
                              'content': f"**{m.group(2).strip()}**"})
             i += 1
@@ -294,8 +331,8 @@ def markdown_to_feishu_card(text: str, title: str,
     card = {
         'config': {'wide_screen_mode': True},
         'header': {
-            'template': template or _pick_template(title),
-            'title': {'tag': 'plain_text', 'content': title or '主升浪日报'},
+            'template': template or _pick_template(card_title),
+            'title': {'tag': 'plain_text', 'content': card_title or '主升浪日报'},
         },
         'elements': elements,
     }
