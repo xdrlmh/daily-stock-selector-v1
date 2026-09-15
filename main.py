@@ -25,7 +25,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import DINGTALK_WEBHOOK, DINGTALK_SECRET, TEST_ONLY, REPORTS_DIR, validate_config
+from src.config import TEST_ONLY, REPORTS_DIR, validate_config
 from src.data_fetcher import (
     fetch_market_spot, fetch_fund_flow_rank,
     filter_main_board, enrich_with_fund_flow,
@@ -33,7 +33,7 @@ from src.data_fetcher import (
 )
 from src.selector import screen_stocks, fallback_from_top_gainers
 from src.report import generate_dingtalk_payload, save_full_report
-from src.dingtalk import push_to_dingtalk
+from src.notifier import push_all, summarize
 from src.portfolio import fill_portfolio_from_candidates, get_active_holdings, MAX_HOLDINGS
 
 
@@ -115,7 +115,7 @@ def main():
     )
     log.info(f'完整报告已保存：{full_report_path}')
 
-    # 8. 推钉钉
+    # 8. 推送（钉钉 + 飞书 双通道，未配置的通道自动跳过）
     if TEST_ONLY:
         log.info('TEST_ONLY 模式，仅打印推送内容，不实际推送')
         print('\n--- [TEST_ONLY] 推送预览 ---')
@@ -123,11 +123,10 @@ def main():
         print(dingtalk_payload['markdown']['text'][:500] + '...')
         print('--- END ---\n')
     else:
-        success, msg = push_to_dingtalk(DINGTALK_WEBHOOK, dingtalk_payload, DINGTALK_SECRET)
-        if success:
-            log.info(f'✅ 钉钉推送成功：{msg}')
-        else:
-            log.error(f'❌ 钉钉推送失败：{msg}')
+        results = push_all(dingtalk_payload, log=log)
+        log.info(f'📤 推送结果：{summarize(results)}')
+        if not any(ok for ok, _ in results.values()):
+            log.error('❌ 所有通道推送均失败，请检查 webhook 配置')
 
     # 8.5 自动补仓（持仓上限 MAX_HOLDINGS 只，按评分顺序补齐空仓位）
     if not top_picks.empty:
