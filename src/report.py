@@ -57,6 +57,21 @@ def format_pct(pct: float) -> str:
     return f'{pct:.2f}%'
 
 
+def pct_color(pct) -> str:
+    """A 股惯例配色：涨 / 正值 = 🔴，跌 / 负值 = 🟢（**与国际市场相反，切勿写反**）。
+
+    用于「板块涨幅」「主力净额」等带方向的数值，保证全报告配色统一。
+    取数失败（None / NaN / 非数字）→ ⚪，不误染红绿。
+    """
+    try:
+        v = float(pct)
+    except (TypeError, ValueError):
+        return '⚪'
+    if pd.isna(v):
+        return '⚪'
+    return '🔴' if v >= 0 else '🟢'
+
+
 def format_yi(amount: float) -> str:
     """把金额转为亿"""
     if pd.isna(amount) or amount == 0:
@@ -260,9 +275,9 @@ def generate_market_section(market: Dict[str, Any]) -> List[str]:
     else:
         lines.append('- **上证指数**：数据缺失')
 
-    # 主力净额一行
+    # 主力净额一行（A 股惯例：红＝净流入/正面，绿＝净流出）
     if main_yi is not None:
-        emoji = '🟢' if main_yi >= 0 else '🔴'
+        emoji = pct_color(main_yi)
         lines.append(f'- **大盘主力**：{emoji} {main_yi:+.1f} 亿')
     else:
         lines.append('- **大盘主力**：数据缺失')
@@ -771,7 +786,8 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
         lines.append('')
         for i, sector in enumerate(sector_heat, 1):
             medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
-            emoji_up = '🟢' if sector['avg_pct'] >= 0 else '🔴'
+            # A 股惯例：涨＝红、跌＝绿（与国际市场相反，勿反）
+            emoji_up = pct_color(sector['avg_pct'])
             lines.append(
                 f'- {medal} **{sector["theme"]}** - {emoji_up}平均涨幅 {sector["avg_pct"]:+.1f}% ｜ '
                 f'主力 {sector["inflow_yi"]:+.1f}亿 ｜ 涨停 {sector["limit_up"]}只'
