@@ -131,6 +131,22 @@ check('每列都是 weighted 布局',
       all(c['width'] == 'weighted' for e in els for c in e['columns']))
 check('表头列内容加粗',
       all(c['elements'][0]['content'].startswith('**') for c in els[0]['columns']))
+check('表头无 **** 双星号残留（二次加粗 bug）',
+      not any('****' in c['elements'][0]['content'] for c in els[0]['columns']),
+      [c['elements'][0]['content'] for c in els[0]['columns']])
+
+# 含 ** 的表头 + 触发列合并的场景
+mix_els = fs._table_to_elements(
+    ['a', '**60日**', '主力净额', 'x', 'y', 'z', 'w'],
+    [['1', '**+25%**', '+3亿', '2', '3', '4', '5']])
+mix_head = [c['elements'][0]['content'] for c in mix_els[0]['columns']]
+check('混合加粗表头（含合并）无双星号',
+      not any('****' in t for t in mix_head), mix_head)
+check('合并后每列表头都正确包裹 **',
+      all(t.startswith('**') and t.endswith('**') for t in mix_head), mix_head)
+check('数据行原有的 ** 不被破坏',
+      '**+25%**' in '\n'.join(
+          c['elements'][0]['content'] for c in mix_els[1]['columns']))
 
 # 11 列（持仓表那种）
 h11 = [f'c{i}' for i in range(11)]
