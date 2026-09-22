@@ -11,7 +11,7 @@ import time
 import tushare as ts
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -383,43 +383,48 @@ def enrich_with_fund_flow(spot_df: pd.DataFrame, fund_df: pd.DataFrame) -> pd.Da
     return spot_df
 
 
-# ============ 均线面板（趋势线 MA120）============
-# 背景：技术面原来是纯行情快照打分（当日涨幅 / 5日涨幅 / 60日趋势 / 量比），
-#       **完全不含均线** → 「技术面高分」可能只是短期涨得猛。
-#       2026-09-22 起新增「趋势线」项：以 MA120 为趋势锚，
-#       MA5>MA120 且现价≥MA120 → 满分；MA5>MA20 → 及格。
+# ============ 均线面板（趋势线 MA120 + 离场均线 MA10/MA20）============
+# 两种用途、两个独立开关（避免互相牵连）：
+#   A. 技术面「趋势线」打分（MA5/MA20/MA120）—— 开关 MA120_TREND（默认 on）
+#      背景：技术面原来是纯行情快照打分（当日涨幅 / 5日涨幅 / 60日趋势 / 量比），
+#      **完全不含均线** → 「技术面高分」可能只是短期涨得猛。
+#      2026-09-22 起新增「趋势线」项：MA5>MA120 且现价≥MA120 → 满分；MA5>MA20 → 及格。
+#   B. 离场均线闸门（MA10 减半 / MA20 清仓）—— 开关 MA_EXIT（默认 on）
+#      背景：云推送改「大波段」后，离场由均线接管（+固定止损/熔断协调，见 portfolio.py）。
 # 取数方式：**按 trade_date 逐日拉全市场日线**（约 130 次调用 ≈ 145 秒），
-#       而不是逐股调 fetch_history_kline（5500+ 次，云端不可接受）。
-# 关断开关：环境变量 MA120_TREND=off → 不取数、不并表 → selector 自动退回原打分。
+#      一次取数同时满足 A 与 B（MA5/10/20/120 一次算完），**零额外调用**。
 MA_TREND_ENABLED = os.environ.get('MA120_TREND', 'on').strip().lower() not in ('0', 'off', 'false', 'no')
+MA_EXIT_ENABLED = os.environ.get('MA_EXIT', 'on').strip().lower() not in ('0', 'off', 'false', 'no')
 MA_TREND_DAYS = 130          # MA120 需 ≥120 根；留 10 根缓冲（停牌/新股）
 _MA_PANEL_CACHE: pd.DataFrame = pd.DataFrame()
 
 
 def fetch_ma_panel(need: int = MA_TREND_DAYS) -> pd.DataFrame:
-    """批量计算全市场 MA5 / MA20 / MA120（模块级缓存，一次运行只算一次）。
+    """批量计算全市场 MA5 / MA10 / MA20 / MA120（模块级缓存，一次运行只算一次）。
 
-    返回 DataFrame[code, ma5, ma20, ma120]（code 为 6 位字符串）：
-      - 均线值按「有效收盘价根数」设门槛：ma5 需 ≥5 根、ma20 需 ≥20 根、ma120 需 ≥120 根；
+    返回 DataFrame[code, ma5, ma10, ma20, ma120]（code 为 6 位字符串）：
+      - 均线值按「有效收盘价根数」设门槛：ma5 ≥5 根、ma10 ≥10、ma20 ≥20、ma120 ≥120；
         不足者置 NaN（次新股即落在此列）。
-    失败 / 关闭开关 → 返回空 DataFrame（调用方自动退回原打分，不阻塞主流程）。
+      - ⚠️ **不因 ma120 缺失而丢行**（2026-09-22 改）：离场只用 MA10/MA20，
+        次新股同样需要；趋势线打分侧的覆盖率统计仍按 ma120 非空计。
+    失败 / 两个开关都关 → 返回空 DataFrame（调用方自动降级，不阻塞主流程）。
     """
     global _MA_PANEL_CACHE
-    if not MA_TREND_ENABLED:
-        print('  ⏭️ 趋势线(MA120)已关闭（MA120_TREND=off）→ 技术面沿用原 8/8/5/4 口径')
+    if not (MA_TREND_ENABLED or MA_EXIT_ENABLED):
+        print('  ⏭️ 均线面板已关闭（MA120_TREND=off 且 MA_EXIT=off）→ 趋势线打分与均线离场均退回原口径')
         return pd.DataFrame()
     if not _MA_PANEL_CACHE.empty:
         return _MA_PANEL_CACHE
     try:
         pro = _init_tushare()
     except Exception as e:
-        print(f'  ⚠️ 趋势线取数跳过（Tushare 未就绪）: {e}')
+        print(f'  ⚠️ 均线面板取数跳过（Tushare 未就绪）: {e}')
         return pd.DataFrame()
 
     # 1) 交易日窗口：右端对齐「已发布的最近交易日」（与全套取数同一口径）
     dates_desc = _trading_days_desc(pro, count=need + 15)
     if not dates_desc:
-        print('  ⚠️ 趋势线取数失败：未取到交易日历')
+        print('  ⚠️ 均线面板取数失败：未取到交易日历')
         return pd.DataFrame()
     if _RESOLVED_TRADE_DATE and _RESOLVED_TRADE_DATE in dates_desc:
         right = dates_desc.index(_RESOLVED_TRADE_DATE)
@@ -427,11 +432,11 @@ def fetch_ma_panel(need: int = MA_TREND_DAYS) -> pd.DataFrame:
         right = _find_anchor(pro, dates_desc)
     window = dates_desc[right:right + need]        # 倒序，[0] 为最近交易日
     if len(window) < 120:
-        print(f'  ⚠️ 趋势线取数失败：有效交易日仅 {len(window)} 天（需 ≥120）')
+        print(f'  ⚠️ 均线面板取数失败：有效交易日仅 {len(window)} 天（需 ≥120）')
         return pd.DataFrame()
 
     # 2) 逐日拉全市场日线（批量，非逐股）
-    print(f'  📡 趋势线取数：{len(window)} 个交易日 × 全市场日线（批量）...')
+    print(f'  📡 均线面板取数：{len(window)} 个交易日 × 全市场日线（批量）...')
     t0 = time.time()
     frames = []
     got = 0
@@ -443,58 +448,92 @@ def fetch_ma_panel(need: int = MA_TREND_DAYS) -> pd.DataFrame:
             frames.append(one)
             got += 1
         if (i + 1) % 30 == 0:
-            print('     ...趋势线 %d/%d 日（已获取 %d 日）'
+            print('     ...均线面板 %d/%d 日（已获取 %d 日）'
                   % (i + 1, len(window), got))
     if got < 120 or not frames:
-        print(f'  ⚠️ 趋势线取数失败：仅 {got}/{len(window)} 个交易日有数据')
+        print(f'  ⚠️ 均线面板取数失败：仅 {got}/{len(window)} 个交易日有数据')
         return pd.DataFrame()
     if got < len(window):
-        print('  ⚠️ 趋势线：%d/%d 个交易日缺数据（缺失日的股票该日不计入均线，'
+        print('  ⚠️ 均线面板：%d/%d 个交易日缺数据（缺失日的股票该日不计入均线，'
               '样本仍 ≥120 根故可继续）' % (len(window) - got, len(window)))
 
     # 3) 透视成「日期 × 代码」收盘价矩阵 → 直接算均线
     pv = pd.concat(frames, ignore_index=True).pivot_table(
         index='trade_date', columns='ts_code', values='close', aggfunc='last')
     if pv.empty:
-        print('  ⚠️ 趋势线取数失败：透视后为空')
+        print('  ⚠️ 均线面板取数失败：透视后为空')
         return pd.DataFrame()
 
     valid = pv.notna().sum()
     ma5 = pv.tail(5).mean().where(valid >= 5)
+    ma10 = pv.tail(10).mean().where(valid >= 10)
     ma20 = pv.tail(20).mean().where(valid >= 20)
     ma120 = pv.tail(120).mean().where(valid >= 120)
 
     out = pd.DataFrame({
         'code': [str(c).split('.')[0].zfill(6) for c in pv.columns],
         'ma5': ma5.values,
+        'ma10': ma10.values,
         'ma20': ma20.values,
         'ma120': ma120.values,
     })
-    out = out[out['ma120'].notna()].reset_index(drop=True)
+    # ⚠️ 只丢掉「四条均线全为 NaN」的行（次新股至少能算 MA5/MA10，离场闸门要用）
+    out = out[out[['ma5', 'ma10', 'ma20', 'ma120']].notna().any(axis=1)].reset_index(drop=True)
     if out.empty:
-        print('  ⚠️ 趋势线取数失败：无任何股票满足 120 根有效收盘价')
+        print('  ⚠️ 均线面板取数失败：无任何股票算出均线')
         return pd.DataFrame()
 
     _MA_PANEL_CACHE = out
-    print('  ✅ 趋势线取数完成：%d 只含 MA120，用时 %.0f 秒（%d 个交易日）'
-          % (len(out), time.time() - t0, got))
+    print('  ✅ 均线面板取数完成：%d 只有均线（其中 %d 只含 MA120），用时 %.0f 秒（%d 个交易日）'
+          % (len(out), int(out['ma120'].notna().sum()), time.time() - t0, got))
+    return out
+
+
+def fetch_ma_map(codes) -> Dict[str, Dict[str, Optional[float]]]:
+    """按股票代码取 **MA10 / MA20**（供持仓结算的均线离场闸门使用）。
+
+    ★ 复用同一份均线面板 → **零额外取数**（不新增任何 API 调用）。
+    返回 {code6: {'ma10': float|None, 'ma20': float|None}}；
+    面板取不到 → 返回 {}（调用方退化为「均线闸门本次不生效」，只走止损/其余闸门）。
+    """
+    want = {str(c).split('.')[0].zfill(6) for c in (codes or []) if str(c).strip()}
+    if not want:
+        return {}
+    panel = fetch_ma_panel()
+    if panel is None or panel.empty:
+        return {}
+
+    def _n(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return None if f != f or f <= 0 else f
+
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    for _, r in panel[panel['code'].isin(want)].iterrows():
+        out[str(r['code'])] = {'ma10': _n(r.get('ma10')), 'ma20': _n(r.get('ma20'))}
     return out
 
 
 def merge_ma_panel(df: pd.DataFrame) -> pd.DataFrame:
-    """把均线面板并进候选表（新增 ma5 / ma20 / ma120 三列）。
+    """把均线面板并进候选表（新增 ma5 / ma10 / ma20 / ma120 四列）。
 
-    取不到数据时**原样返回**（不新增列）→ selector 的 _ma_trend_tier 返回 None
-    → 技术面自动退回原 8/8/5/4 口径，与改版前行为一致。
+    - `MA120_TREND=off` → **不并表**（技术面严格退回原 8/8/5/4 口径）
+    - 取不到数据时**原样返回**（不新增列）→ selector 的 _ma_trend_tier 返回 None
+      → 技术面自动退回原口径，与改版前行为一致。
     """
     if df is None or df.empty:
+        return df
+    if not MA_TREND_ENABLED:
+        print('  ⏭️ 趋势线(MA120)已关闭（MA120_TREND=off）→ 技术面沿用原 8/8/5/4 口径')
         return df
     panel = fetch_ma_panel()
     if panel is None or panel.empty:
         return df
     df = df.copy()
     df['code_str'] = df['code'].astype(str).str.zfill(6)
-    df = df.merge(panel[['code', 'ma5', 'ma20', 'ma120']],
+    df = df.merge(panel[['code', 'ma5', 'ma10', 'ma20', 'ma120']],
                   left_on='code_str', right_on='code', how='left', suffixes=('', '_ma'))
     hit = int(df['ma120'].notna().sum()) if 'ma120' in df.columns else 0
     print(f'  ✅ 均线面板已并入：{hit}/{len(df)} 只含 MA120')
