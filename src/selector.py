@@ -757,6 +757,10 @@ def analyze_sector_leaders(df: pd.DataFrame, top_n: int = 3,
     if 'main_net_inflow' not in d.columns:
         d['main_net_inflow'] = 0.0
     d['main_net_inflow'] = pd.to_numeric(d['main_net_inflow'], errors='coerce').fillna(0.0)
+    # ⚠️ **拍板决策（2026-09-23 用户明确）**：板块「资金榜」**保持当日主力净额口径，不变**。
+    #    背景：本轮个股资金面因子已改为「超大单 5日/60日 趋势 + 占比」（`CAPITAL_MODE='elg'`），
+    #    两者口径不再一致。已就此提问，用户选择「板块资金榜仍用当日净额逻辑不变」
+    #    ⇒ **不要再把此处改成超大单口径**（不是遗漏，是有意为之）。
 
     total = len(d)
     tagged = int((d['_sector'] != '其他').sum())
