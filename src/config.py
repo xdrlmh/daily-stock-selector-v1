@@ -47,6 +47,37 @@ SCORE_WEIGHTS = {
     'fundamental': 25,
 }
 
+# ============ 资金面因子（2026-09-22 大波段改造）============
+# 背景：原「当日主力净流入」前 5% 在主板 3168 只 × 7 个信号日上 **7/7 全负超额**
+#      （平均超额 −5.42%）—— 典型的「当日放量大涨 → 追高」。改「超大单持续流入」口径。
+# 新口径（实证：主板 universe，过滤后超额 −0.87%，绝对额排序仍 −4.54%）：
+#   A. 趋势确认：近 5 日**日均**超大单净额 > 近 60 日**日均** 且 > 0   → 10 分（否则 5 / 0）
+#   B. 占比强度：近 5 日超大单净额 / 近 5 日成交额 的横截面占比        → 0~4 分
+#   C. 换手率合理性（沿用原口径）                                     → 0~6 分
+#   合计仍 = 20 分（SCORE_WEIGHTS['capital']）
+#   ★ 硬过滤：`A` 不成立者**直接剔除候选池**（不占 TOP5 名额）—— 与实证口径一致。
+CAPITAL_MODE = os.environ.get('CAPITAL_MODE', 'elg').strip().lower()
+#   'elg'    = 新口径（超大单 5日/60日 趋势 + 占比），默认
+#   'legacy' = 旧口径（当日主力净流入 0~14 分 + 换手 0~6 分），回退用
+
+CAPITAL_TREND_FILTER = os.environ.get('CAPITAL_TREND_FILTER', 'on').strip().lower() \
+    not in ('0', 'off', 'false', 'no')      # 关掉 = 只打分不剔除（回退用）
+
+CAPITAL_SHORT_DAYS = 5        # 短周期窗口（日）
+CAPITAL_LONG_DAYS = 60        # 长周期窗口（日）
+CAPITAL_MIN_VALID_DAYS = 4    # 近 5 日有效数据门槛：<4 天视为「无信号」→ 资金面 0 分，
+                              # 且**不计算占比**（防止停牌/次新导致占比虚高，实测 600825 仅 2 天数据算出 76%）
+# 「数据不足」的归零范围（用户拍板原文「资金面给 0 分」→ 按字面＝整个维度归零）：
+#   'all'      = 资金面整个 20 分归零（含换手率子项）—— 默认，拍板字面口径
+#   'elg_only' = 只把「超大单趋势 / 占比」两项归零，换手率（与资金流数据无关）照常计分
+# 切换成本为零（环境变量 CAPITAL_MISSING_ZERO_SCOPE），不影响其他任何逻辑。
+CAPITAL_MISSING_ZERO_SCOPE = os.environ.get('CAPITAL_MISSING_ZERO_SCOPE', 'all').strip().lower()
+CAPITAL_ELG_FULL = 10         # A 项：5日日均 > 60日日均 且 >0
+CAPITAL_ELG_PARTIAL = 5       # A 项：5日日均 > 0 但未放大
+CAPITAL_ELG_NONE = 0          # A 项：不满足 / 数据不足
+# B 项档位：[(占比下限 %, 分)]，从高到低匹配（占比分布实测：中位 1.4% / p90 5.1% / p99 13.6%）
+CAPITAL_RATIO_BANDS = ((5.0, 4), (2.0, 3), (0.5, 2), (0.0, 1))
+
 
 def validate_config():
     """验证配置完整性：当前启用的通道中，至少要有一个配好了 webhook。
