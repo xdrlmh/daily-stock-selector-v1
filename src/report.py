@@ -56,9 +56,9 @@ except ImportError:  # 兼容以顶层模块方式导入
 
 # 资金面口径（'elg' = 超大单 5日/60日 趋势；'legacy' = 当日主力净流入）
 try:
-    from src.config import CAPITAL_MODE
+    from src.config import CAPITAL_MODE, CAPITAL_DAY_RATIO_CAP
 except ImportError:      # 兼容以顶层模块方式导入
-    from config import CAPITAL_MODE
+    from config import CAPITAL_MODE, CAPITAL_DAY_RATIO_CAP
 
 
 # TOP 表第 7 列列名（新口径 = 超大单占比 / legacy = 当日主力净额）—— 模块级，
@@ -67,9 +67,16 @@ ELG_HEAD = '超大单占比' if CAPITAL_MODE == 'elg' else '主力净额'
 
 
 def screen_footnote() -> str:
-    """筛选口径脚注（随 CAPITAL_MODE 变化，保证回退路径文案不变）"""
+    """筛选口径脚注（随 CAPITAL_MODE 变化，保证回退路径文案不变）
+
+    单日占比上限启用时追加说明（用户拍板 2026-09-23）——
+    该约束会**改变超大单数值本身**（截顶后），不写出来会让人误以为数据被低估。
+    """
     if CAPITAL_MODE == 'elg':
-        return '> 🎯 筛选：主板非ST / 趋势向上 / 超大单5日日均>60日日均'
+        _base = '> 🎯 筛选：主板非ST / 趋势向上 / 超大单5日日均>60日日均'
+        if CAPITAL_DAY_RATIO_CAP and CAPITAL_DAY_RATIO_CAP > 0:
+            _base += f'（单日占比已截顶 {CAPITAL_DAY_RATIO_CAP:g}%）'
+        return _base
     return '> 🎯 筛选：主板非ST / 趋势向上 / 主力流入'
 
 
@@ -1183,8 +1190,10 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
     lines.append('|---|---|---|')
     lines.append('| 技术面 | 25% | 当日涨幅、5日涨幅、60日趋势、量比、**趋势线(MA120)** |')
     lines.append('| 资金面 | 20% | ' + (
-        '**超大单5日/60日趋势**、超大单占成交额、换手率' if CAPITAL_MODE == 'elg'
-        else '主力净流入、换手率') + ' |')
+        ('**超大单5日/60日趋势**、超大单占成交额、换手率'
+         + (f'（单日占比≤{CAPITAL_DAY_RATIO_CAP:g}%）'
+            if CAPITAL_DAY_RATIO_CAP and CAPITAL_DAY_RATIO_CAP > 0 else ''))
+        if CAPITAL_MODE == 'elg' else '主力净流入、换手率') + ' |')
     lines.append('| 估值 | 15% | PE-TTM、PB |')
     lines.append('| 题材催化 | 15% | 热门主题、当日关注度 |')
     lines.append('| 基本面 | 25% | 业绩（PE 间接）、市值、稳定性 |')
