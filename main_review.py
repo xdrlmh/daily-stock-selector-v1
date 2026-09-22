@@ -36,9 +36,9 @@ from src.config import TEST_ONLY, REPORTS_DIR, validate_config
 from src.data_fetcher import (
     fetch_market_spot, fetch_fund_flow_rank,
     filter_main_board, enrich_with_fund_flow,
-    fetch_market_review,
+    fetch_market_review, merge_ma_panel,
 )
-from src.selector import screen_stocks, analyze_sector_heat
+from src.selector import screen_stocks, analyze_sector_heat, analyze_sector_leaders
 from src.report import generate_review_payload, save_review_report
 from src.notifier import push_all, summarize
 from src.portfolio import (
@@ -229,6 +229,9 @@ def main():
     enriched = enrich_with_fund_flow(main_board, fund_df)
     log.info(f'合并资金流后：{len(enriched)} 只')
 
+    # 3.5 合并均线面板（趋势线 MA120）—— 取不到数据时原样返回，技术面自动退回原口径
+    enriched = merge_ma_panel(enriched)
+
     # 4. 大盘复盘数据（含实际数据日期）
     market = fetch_market_review()
     data_date = market.get('data_date') or datetime.now().strftime('%Y%m%d')
@@ -242,11 +245,20 @@ def main():
     # 5. 今日强势股 TOP5（收盘后重筛）
     top_picks, warnings, all_scored = screen_stocks(enriched)
 
-    # 6. 板块温度 TOP3（基于全市场当日数据）
-    sector_heat = analyze_sector_heat(enriched, top_n=3)
-    if sector_heat:
-        for s in sector_heat:
-            print(f"  🔥 {s['theme']}: 平均{s['avg_pct']:+.1f}% | 主力{s['inflow_yi']:+.1f}亿 | 涨停{s['limit_up']}只")
+    # 6. 板块方向（【任务②】三榜：涨幅 / 主力资金 / 涨停家数，独立排序）
+    #    原「板块温度」= 涨幅×0.4+资金×0.3+涨停×0.3，三项量纲混杂、实际由资金主导
+    #    （实测资金项话语权是涨幅的 24.5 倍）→ 拆成三榜，口径透明。
+    sector_leaders = analyze_sector_leaders(enriched, top_n=3)
+    _cov = sector_leaders.get('coverage') or {}
+    if _cov:
+        log.info('板块归类覆盖：%s/%s 只（%s%%）｜ %s 个板块',
+                 _cov.get('tagged'), _cov.get('total'), _cov.get('ratio'), _cov.get('n_sector'))
+    for _key, _title in (('gainers', '涨幅'), ('flows', '资金'), ('limit_ups', '涨停')):
+        for _i, _s in enumerate(sector_leaders.get(_key) or [], 1):
+            print(f"  🔥 {_title}榜#{_i} {_s['theme']}: 平均{_s['avg_pct']:+.1f}% | "
+                  f"主力{_s['inflow_yi']:+.1f}亿 | 涨停{_s['limit_up']}只 | {_s['cnt']}只成分")
+    # 三榜为空时回退旧混合榜（报告侧仍支持，回滚零成本）
+    sector_heat = None if sector_leaders.get('all') else analyze_sector_heat(enriched, top_n=3)
 
     # 7. 💼 持仓结算 + 自动补仓（原持仓监控已合并于此）
     price_map = build_price_map(spot_df)
@@ -282,6 +294,7 @@ def main():
         all_stocks=all_scored.head(50),
         market=market,
         sector_heat=sector_heat,
+        sector_leaders=sector_leaders,
         holdings_status=holdings_status,
         closed_today=closed_today,
         new_positions=new_positions,
@@ -298,6 +311,7 @@ def main():
         all_stocks=all_scored.head(50),
         market=market,
         sector_heat=sector_heat,
+        sector_leaders=sector_leaders,
         reports_dir=REPORTS_DIR,
         holdings_status=holdings_status,
         closed_today=closed_today,
