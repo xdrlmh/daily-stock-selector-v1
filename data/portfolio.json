@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "updated_at": "2026-09-22 10:43:22",
+  "updated_at": "2026-09-22 14:23:19",
   "holdings": [
     {
       "code": "600104",
@@ -28,7 +28,15 @@
       "close_reason": null,
       "closed_peak_pnl": null,
       "closed_days_held": null,
-      "source": "review_refill"
+      "source": "review_refill",
+      "half_ratio": 0.5,
+      "half_sold": true,
+      "half_sold_at": "2026-09-22 14:23:19",
+      "half_sold_date": "2026-09-22",
+      "half_sold_price": 11.07,
+      "half_sold_pnl": -5.63,
+      "remaining_ratio": 0.5,
+      "closed_pnl_leg2": null
     },
     {
       "code": "002011",
@@ -56,7 +64,15 @@
       "close_reason": null,
       "closed_peak_pnl": null,
       "closed_days_held": null,
-      "source": "review_refill"
+      "source": "review_refill",
+      "half_ratio": 0.5,
+      "half_sold": false,
+      "half_sold_at": null,
+      "half_sold_date": null,
+      "half_sold_price": null,
+      "half_sold_pnl": null,
+      "remaining_ratio": 1.0,
+      "closed_pnl_leg2": null
     },
     {
       "code": "002508",
@@ -84,7 +100,15 @@
       "close_reason": null,
       "closed_peak_pnl": null,
       "closed_days_held": null,
-      "source": "review_refill"
+      "source": "review_refill",
+      "half_ratio": 0.5,
+      "half_sold": false,
+      "half_sold_at": null,
+      "half_sold_date": null,
+      "half_sold_price": null,
+      "half_sold_pnl": null,
+      "remaining_ratio": 1.0,
+      "closed_pnl_leg2": null
     }
   ]
 }
