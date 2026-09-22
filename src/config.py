@@ -72,11 +72,44 @@ CAPITAL_MIN_VALID_DAYS = 4    # 近 5 日有效数据门槛：<4 天视为「无
 #   'elg_only' = 只把「超大单趋势 / 占比」两项归零，换手率（与资金流数据无关）照常计分
 # 切换成本为零（环境变量 CAPITAL_MISSING_ZERO_SCOPE），不影响其他任何逻辑。
 CAPITAL_MISSING_ZERO_SCOPE = os.environ.get('CAPITAL_MISSING_ZERO_SCOPE', 'all').strip().lower()
+
+# ── ★ 单日占比上限（软截顶，2026-09-23 用户拍板）─────────────────────────────
+# 每日超大单净额 ≤ 当日成交额 × CAP%  ⇒ 5 日占比的**上界 = CAP%**。
+# 目的：抑制「单日爆量主导 5 日日均 / 把占比推高」（实测 000756 前 4 天≈0、第 5 天 +2.6 亿）。
+# 实证（主板 3168 只 × 7 信号日，超额 vs 主板全样本 −0.47%）：
+#   不截顶：池均值 −0.87% ｜ CAP=2.5%：池均值 −0.00%、过滤后通过率 26.9%（约 850 只）、
+#   排序饱和仅 3 只。★ 「单日占比过高」本身是**负面特征**（截顶越紧、池均值单调改善到 1%）。
+#   ★ 作用范围必须是**上游统一**（占比项必须截顶；实测「只截趋势项」无效 −1.1~−2.2%）。
+#   `0` = 关闭（等价回退到不截顶；零成本，改环境变量即可）。
+CAPITAL_DAY_RATIO_CAP = None
+try:
+    _cap_raw = (os.environ.get('CAPITAL_DAY_RATIO_CAP', '2.5') or '').strip().lower()
+    CAPITAL_DAY_RATIO_CAP = 0.0 if _cap_raw in ('', '0', 'off', 'none', 'false', 'no') \
+        else float(_cap_raw)
+except ValueError:
+    CAPITAL_DAY_RATIO_CAP = 2.5
+
 CAPITAL_ELG_FULL = 10         # A 项：5日日均 > 60日日均 且 >0
 CAPITAL_ELG_PARTIAL = 5       # A 项：5日日均 > 0 但未放大
 CAPITAL_ELG_NONE = 0          # A 项：不满足 / 数据不足
 # B 项档位：[(占比下限 %, 分)]，从高到低匹配（占比分布实测：中位 1.4% / p90 5.1% / p99 13.6%）
 CAPITAL_RATIO_BANDS = ((5.0, 4), (2.0, 3), (0.5, 2), (0.0, 1))
+
+# ⚠️ **连带修正（必须）**：截顶后占比恒 ≤ CAP，而档位匹配是**严格 `>`**
+#    ⇒ 若沿用原档（≥5% → 4 分），4 分档**永远不可达**，等于把用户上轮拍板的
+#      「占比 4 分」架空。
+#    ⇒ 启用截顶时把档位**按原比例内缩到 CAP 的可达域**：
+#       4 分：> 0.80·CAP ｜ 3 分：> 0.32·CAP ｜ 2 分：> 0.08·CAP ｜ 1 分：> 0
+#       （系数 = 原档界限 5.0 / 2.0 / 0.5 相对 5.0 的比例 × 0.8 内缩；
+#         0.8 内缩是为了让「恰在 CAP」也能落进 4 分档 —— 否则仍不可达）
+#       CAP=2.5 ⇒ (2.00, 4) / (0.80, 3) / (0.20, 2) / (0, 1)
+#    `CAPITAL_RATIO_BANDS_FROM_CAP=0` 可回到固定档位（零成本）。
+CAPITAL_RATIO_BANDS_FROM_CAP = os.environ.get(
+    'CAPITAL_RATIO_BANDS_FROM_CAP', 'on').strip().lower() not in ('0', 'off', 'false', 'no')
+if CAPITAL_DAY_RATIO_CAP and CAPITAL_DAY_RATIO_CAP > 0 and CAPITAL_RATIO_BANDS_FROM_CAP:
+    _c = float(CAPITAL_DAY_RATIO_CAP)
+    CAPITAL_RATIO_BANDS = tuple(
+        (round(_c * _f, 4), _p) for _f, _p in ((0.80, 4), (0.32, 3), (0.08, 2), (0.0, 1)))
 
 
 def validate_config():
