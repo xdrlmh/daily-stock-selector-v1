@@ -4,59 +4,85 @@
 设计要点：
 1. 最多同时持有 MAX_HOLDINGS(3) 只；
 2. 买入价按「信号日次日开盘价」归一化（贴近模拟盘真实买入成本）；
-3. 止盈＝**移动止盈**：盈利首次达到 +15% 后启动，随后跟踪启动以来的最高价，
-   从最高价回撤 8% 即卖出（保护利润，同时给主升浪留足呼吸空间）；
-4. 时间止损＝**清理僵尸股 / 低效股**：仓位有限（3 只），长期不走出趋势的票必须让位；
-5. 平仓后自动补仓（由盘后复盘流程调用，详见 main_review.py）；
-6. 持仓池持久化到 data/portfolio.json（GitHub Actions 中由 workflow 回写仓库）。
+3. 离场＝**大波段口径（2026-09-22 起）**：固定止损 −7% ＋ 均线离场（破 MA10 减半 /
+   破 MA20 清仓），由「大盘弱势熔断」在暴跌日暂缓其中的减仓动作；
+4. 平仓后自动补仓（由盘后复盘流程调用，详见 main_review.py）；
+5. 持仓池持久化到 data/portfolio.json（GitHub Actions 中由 workflow 回写仓库）。
 
-移动止盈细则：
-- 启动线：盈利 ≥ trail_activate_pct（默认 +15%）
-- 峰值 trail_high：取「盘中最高价」与收盘价中的较大者，逐日抬升（只上不下）
-- 触发线：trail_high × (1 - trail_drawdown_pct/100)，默认回撤 8%
-- 判定：盘中最低价 ≤ 触发线 → 视为触发，成交价＝触发线（贴近真实移动止盈单）
+★★ 离场决策树（唯一口径，按优先级；判定价 = **当日收盘价**）
+--------------------------------------------------------------------------
+  ① 固定止损   收盘盈亏 ≤ EXIT_STOP_LOSS_PCT(-7%)           → 全部清仓
+  ② 破 MA20    收盘价 < MA20                                → 全部清仓（含已减半的剩余仓位）
+  ③ 移动止盈   盈利≥+15% 启动 → 峰值回撤 8%                → 全部清仓（**默认停用**）
+  ④ 破 MA10    收盘价 < MA10 且**尚未减半**                 → 卖出 50%（减半仓）
+  ⑤ 时间止损   僵尸/低效股                                  → 全部清仓（**默认停用**）
 
-时间止损细则（2026-09-11 新增，稳健档 8/15）：
-- 交易日钟 days_held：每遇到一个**新的行情日** +1（同日重复运行不重复计数，天然幂等）
-- 期间最高涨幅 peak_high_pnl：由持有期内的最高价算出（`peak_high`，只上不下）
-- 🧟 僵尸股：持有 ≥ ZOMBIE_DAYS(8) 交易日 且 期间最高涨幅 < ZOMBIE_PEAK_PCT(3%)  → 清理
-- 🐌 低效股：持有 ≥ INEFFICIENT_DAYS(15) 交易日 且 未启动移动止盈 且 期间最高涨幅 < 5% → 清理
-- 🔒 已启动移动止盈的持仓**永久豁免**时间止损（趋势已确认，交给移动止盈）
+★★ 「整体协调」的三条铁律（2026-09-22 用户拍板 + 实测支撑）
+--------------------------------------------------------------------------
+  1. **事件型信号不可暂缓**：固定止损一旦触及必须执行 —— 次日若反弹，该信号会**永久消失**，
+     暂缓 = 直接漏掉风控。⇒ 熔断**永不拦**固定止损。
+  2. **趋势硬底线不可暂缓**：破 MA20 是趋势终结判定，且它承担了「−7% 之上」的主要全平职责。
+     实测：一旦拦它，收益 −0.13pt、最深浮亏恶化 0.23pt、止损打满仓次数 79→84。
+     ⇒ 熔断**不拦**破 MA20 清仓。
+  3. **节奏型信号可暂缓一天**：破 MA10 减半属于「减仓换手」而非「风险出清」，且是**状态型**
+     信号（次日仍破位会自然重判，不存在漏执行）。暴跌日个股普遍假破 MA10，
+     暂缓一天的成本实测 ≈ 0（+0.01pt；15 次暂缓中有 4 次次日站回 MA10 = 避免假破）。
+     ⇒ 熔断**只拦**破 MA10 减半。
+  ⇒ 三个闸门因此各司其职、互不越权：止损管「价格硬底线」、MA20 管「趋势终结」、
+     MA10 管「节奏减仓」，熔断管「暴跌日不追跌减仓」。**没有任何动作会被熔断吞掉**。
 
-大盘弱势熔断（2026-09-11 新增）：
+大盘弱势熔断（2026-09-11 新增，2026-09-22 改口径）
 - 触发：上证指数当日跌幅 ≤ MARKET_FUSE_DROP_PCT(-2.0%)
-- 作用：**当天暂停时间止损**（僵尸/低效清理属"主动换仓"，暴跌日不做卖出决策，
-  避免在系统性下跌里被批量扫出去、卖在最低点；次日大盘企稳即自动补执行）
-- 不影响：固定止损 -7%、移动止盈**照常执行** —— 那是保护性纪律，不因大盘弱而放宽
+- 作用：① 当天**暂缓「破 MA10 减半」**（暴跌日不追跌减仓，次日企稳自动补执行）；
+        ② 当天**暂停补仓 / 新开仓**（暴跌日既不砍也不加，口径自洽）
+- 不拦：固定止损 −7%、破 MA20 清仓、移动止盈（均为保护性纪律）
 - 数据缺失（指数涨跌幅为 None/NaN）→ **不熔断**，避免因取数失败导致长期停摆
 
-触发优先级：**止损 > 移动止盈 > 时间止损（大盘熔断时可被拦下）> 接近启动线提醒**
+半仓（2026-09-22 新增）
+- 触发：收盘价 < MA10 且尚未减半 → 卖出 50%，落盘 `half_sold=True` 等字段
+- **不补仓**：破 MA10 后不回补那 50%（用户拍板）；该票**仍占 1 个持仓名额**直至清仓
+- 减半仓**不改变**买入成本 `buy_price` ⇒ 固定止损 −7% 仍以原始成本为基准（不是移动止损）
+- 统计口径：一笔「减半 + 后续清仓」的交易**合并为 1 笔**，
+  `closed_pnl` = 0.5×半仓段收益 + 0.5×剩余段收益（另存 `half_sold_pnl` / `closed_pnl_leg2` 留痕）
+- 幂等：`half_sold` 为真时不再重复减半（同日重复跑复盘安全）
 
-数据模型（version 2）：
+触发优先级：**固定止损 > 破MA20清仓 > 移动止盈 > 破MA10减半 > 时间止损 > 接近启动线提醒**
+（②③ 均为全平类、④ 为减仓类、⑤ 为换仓类；顺序固定以保证可复现。②与①同日触发时成交价同为收盘价，
+故顺序不影响金额，仅决定 `close_reason` 标注。）
+
+数据模型（version 2）
 {
   "version": 2,
-  "updated_at": "2026-09-11 18:30:00",
+  "updated_at": "2026-09-22 18:30:00",
   "holdings": [
     {
       "code": "601975", "name": "招商南油",
       "buy_price": 4.48,               # entry_pending=true 时为信号日收盘价
-      "buy_date": "2026-09-12",        # 信号日
+      "buy_date": "2026-09-22",        # 信号日
       "entry_date": null,              # 实际建仓日（=信号次日，归一化后写入）
       "entry_pending": true,           # true=等待次日开盘价归一化
       "shares": 0,
       "stop_loss_pct": -7.0,           # 固定止损
-      "trail_activate_pct": 15.0,      # 移动止盈启动线
-      "trail_drawdown_pct": 8.0,       # 启动后回撤卖出幅度
-      "trail_active": false,           # 移动止盈是否已启动
-      "trail_high": null,              # 启动以来的最高价（只上不下）
-      "days_held": 0,                  # 🆕 已持有交易日数（每新行情日 +1）
-      "last_review_date": null,        # 🆕 上次参与结算的行情日（幂等计数用）
-      "peak_high": null,               # 🆕 持有期内最高价（只上不下，供时间止损判定）
+      "half_ratio": 0.5,               # 🆕 破 MA10 减半的比例
+      "half_sold": false,              # 🆕 是否已减半（幂等开关）
+      "half_sold_at": null,            # 🆕 减半落盘时间
+      "half_sold_date": null,          # 🆕 减半的行情日
+      "half_sold_price": null,         # 🆕 减半成交价
+      "half_sold_pnl": null,           # 🆕 减半段收益%
+      "remaining_ratio": 1.0,          # 🆕 剩余仓位比例（减半后 0.5）
+      "trail_activate_pct": 15.0,      # 移动止盈启动线（默认停用）
+      "trail_drawdown_pct": 8.0,
+      "trail_active": false,
+      "trail_high": null,
+      "days_held": 0,
+      "last_review_date": null,
+      "peak_high": null,
       "alerted": false, "alerted_at": null,
       "closed": false, "closed_at": null,
       "closed_price": null, "closed_pnl": null, "close_reason": null,
-      "closed_peak_pnl": null,         # 平仓时的峰值盈亏（复盘展示用）
-      "closed_days_held": null,        # 🆕 平仓时已持有交易日数
+      "closed_pnl_leg2": null,         # 🆕 最后一段（未减半时=全仓）收益%
+      "closed_peak_pnl": null,
+      "closed_days_held": null,
       "source": "morning_screen"       # morning_screen | review_refill
     }
   ]
@@ -94,38 +120,57 @@ DATA_DIR = PROJECT_ROOT / 'data'
 PORTFOLIO_PATH = DATA_DIR / 'portfolio.json'
 
 # ============= 持仓参数 =============
-DEFAULT_STOP_LOSS_PCT = -7.0     # 固定止损 -7%
+MAX_HOLDINGS = 3                 # 最大同时持仓数（模拟盘买进头 3 只）
+MAX_CLOSED_KEEP = 30             # 仅保留最近 N 条已平仓记录，防止文件无限膨胀
+
+# ============= 离场规则（大波段口径，2026-09-22 起）=============
+# ★ 参数单一来源：调参只改这一处。
+# 决策树：① 固定止损 → ② 破MA20清仓 → ③ 移动止盈(默认停用) → ④ 破MA10减半 → ⑤ 时间止损(默认停用)
+EXIT_USE_STOP = _env_bool('EXIT_USE_STOP', True)          # ① 固定止损总开关
+EXIT_STOP_LOSS_PCT = _env_float('EXIT_STOP_LOSS_PCT', -7.0)   # 收盘盈亏 ≤ 此值 → 全部清仓
+EXIT_USE_MA = _env_bool('EXIT_USE_MA', True)              # ②④ 均线离场总开关
+EXIT_MA_HALF = 10                # ④ 破 MA10 → 减半仓（需 ≥10 根有效收盘价，否则本闸门不生效）
+EXIT_MA_CLEAR = 20               # ② 破 MA20 → 全部清仓（含已减半的剩余仓位）
+EXIT_MA_HALF_RATIO = _env_float('EXIT_MA_HALF_RATIO', 0.5)    # 减半比例（0.5 = 卖一半）
+DEFAULT_STOP_LOSS_PCT = EXIT_STOP_LOSS_PCT   # 兼容旧字段名 / 旧调用
+
+# 旧离场子系统（2026-09-22 起默认停用，代码保留 → 环境变量可零成本回滚）
+TRAIL_ENABLED = _env_bool('TRAIL_ENABLED', False)         # ③ 移动止盈（默认关）
 TRAIL_ACTIVATE_PCT = 15.0        # 盈利达到 +15% 启动移动止盈
 TRAIL_DRAWDOWN_PCT = 8.0         # 启动后从最高价回撤 8% → 卖出（3=激进锁利 / 8=宽吃趋势）
 WARNING_PROFIT_PCT = 10.0        # 接近启动线的提醒阈值
 DEFAULT_TAKE_PROFIT_PCT = TRAIL_ACTIVATE_PCT   # 兼容旧字段/旧调用（含义＝启动线）
-MAX_HOLDINGS = 3                 # 最大同时持仓数（模拟盘买进头 3 只）
-MAX_CLOSED_KEEP = 30             # 仅保留最近 N 条已平仓记录，防止文件无限膨胀
 
-# ============= 时间止损参数（清理僵尸股 / 低效股）=============
+# ============= 时间止损参数（清理僵尸股 / 低效股）· ⑤ 默认停用 =============
 # 逻辑：仓位只有 3 个，长期不走出趋势的票要主动让位，否则错过新的主升浪机会。
 # 判定口径统一用「期间最高涨幅 peak_high_pnl」（持有期内最高价，只上不下），
 # 比看当前盈亏公平：单日大盘普跌不会把本来形态不错的票误杀。
-TIME_STOP_ENABLED = True         # 时间止损总开关
+TIME_STOP_ENABLED = _env_bool('TIME_STOP_ENABLED', False)   # ⚠️ 2026-09-22 起默认 False
 ZOMBIE_DAYS = 8                  # 🧟 僵尸股考察期（交易日）——约 2 周（稳健档）
 ZOMBIE_PEAK_PCT = 3.0            #    期间最高涨幅低于此值 → 判为僵尸（从没像样动过）
 INEFFICIENT_DAYS = 15            # 🐌 低效股考察期（交易日）——约 3 周（稳健档）
 INEFFICIENT_PEAK_PCT = 5.0       #    期满仍未启动移动止盈且峰值低于此值 → 判为低效
-# 参考档位：激进 3/7 ｜ 快档 5/10 ｜ 当前·稳健 8/15
+# 参考档位：激进 3/7 ｜ 快档 5/10 ｜ 原·稳健 8/15
 
-# ============= 大盘弱势熔断参数（2026-09-11 新增）=============
-# 逻辑：大盘暴跌日不做「主动换仓」——暴跌往往泥沙俱下，此时清理僵尸股很容易卖在最低点，
-#      次日大盘企稳又得重新追高。熔断只拦时间止损，止损/移动止盈照常（那是硬纪律）。
+# ============= 大盘弱势熔断参数（2026-09-11 新增 / 2026-09-22 改口径）=============
+# 逻辑：大盘暴跌日不做「追跌减仓」与「主动加仓」——暴跌往往泥沙俱下，
+#      此时减半仓容易卖在最低点，次日大盘企稳又得重新追高。
+# ★ 作用范围（MARKET_FUSE_SCOPE）＝ 只拦「破 MA10 减半」＋ 暂停补仓；
+#   固定止损 −7% 与破 MA20 清仓**照常执行**（保护性纪律，不因大盘弱而放宽）。
 # 取数：复用 fetch_market_review() 的上证指数涨跌幅（Tushare index_daily）
 MARKET_FUSE_ENABLED = _env_bool('MARKET_FUSE_ENABLED', True)
 MARKET_FUSE_INDEX = '上证指数'    # 判定基准（仅供文案展示）
 MARKET_FUSE_DROP_PCT = _env_float('MARKET_FUSE_DROP_PCT', -2.0)
-MARKET_FUSE_SCOPE = 'time_stop'  # 熔断作用范围：仅时间止损（预留扩展）
-# 以上两个参数支持环境变量覆盖（MARKET_FUSE_ENABLED / MARKET_FUSE_DROP_PCT），
-# 便于应急调整；云端验证时可用极端阈值（如 99）强制触发熔断来验证拦截路径。
+MARKET_FUSE_SCOPE = 'ma10_half'  # 熔断作用范围：仅「破 MA10 减半」这一减仓动作
+MARKET_FUSE_BLOCK_REFILL = _env_bool('MARKET_FUSE_BLOCK_REFILL', True)  # 熔断日暂停补仓/新开仓
+# 以上参数支持环境变量覆盖，便于应急调整；云端验证时可用极端阈值（如 99）强制触发熔断来验证拦截路径。
 
 STATUS_TEXT = {
     'stop_loss': '🚨 触发止损',
+    'ma20_exit': '🔻 破MA20 清仓',
+    'ma10_half': '✂️ 破MA10 减半仓',
+    'ma10_half_fused': '✂️ 破MA10 减半·熔断暂缓',
+    'half_holding': '◐ 半仓持有（已破MA10）',
     'take_profit': '🔒 移动止盈卖出',
     'trailing': '🔒 移动止盈中',
     'warning': '⚡ 接近启动线',
@@ -141,11 +186,20 @@ STATUS_TEXT = {
 # 时间止损平仓原因（供上层判断/渲染）
 TIME_STOP_REASONS = ('time_stop_zombie', 'time_stop_inefficient')
 
+# ★ 熔断可拦下的触发原因（协调铁律：只含「节奏型减仓」的信号，绝不含止损/MA20清仓）
+FUSE_BLOCKABLE_TRIGGERS = TIME_STOP_REASONS + ('ma10_half',)
+
 # 熔断暂缓对应的状态键（reason → fused 状态文案）
 FUSE_STATUS_KEY = {
     'time_stop_zombie': 'time_stop_zombie_fused',
     'time_stop_inefficient': 'time_stop_inefficient_fused',
+    'ma10_half': 'ma10_half_fused',
 }
+
+# 全平类触发原因（用于上层判断「本次是否已清仓」）
+FULL_EXIT_REASONS = ('stop_loss', 'ma20_exit', 'take_profit') + TIME_STOP_REASONS
+# 减仓类触发原因（不清仓，只减半）
+HALF_EXIT_REASONS = ('ma10_half',)
 
 
 # ============= 内部工具 =============
@@ -178,7 +232,7 @@ def _empty_portfolio() -> Dict:
 
 
 def _migrate(portfolio: Dict) -> Dict:
-    """老版本持仓补齐移动止盈 / 时间止损字段（幂等）"""
+    """老版本持仓补齐移动止盈 / 时间止损 / 半仓 字段（幂等）"""
     for h in portfolio.get('holdings', []):
         h.setdefault('stop_loss_pct', DEFAULT_STOP_LOSS_PCT)
         if 'trail_activate_pct' not in h:
@@ -194,6 +248,17 @@ def _migrate(portfolio: Dict) -> Dict:
         h.setdefault('last_review_date', None)
         h.setdefault('peak_high', None)
         h.setdefault('closed_days_held', None)
+        # ---- 半仓（破 MA10 减半）字段 ----
+        # ⚠️ 老持仓一律视为「未减半」：不追溯补扣半仓，避免用历史数据反推当时的 MA10 破位。
+        h.setdefault('half_ratio', EXIT_MA_HALF_RATIO)
+        h.setdefault('half_sold', False)
+        h.setdefault('half_sold_at', None)
+        h.setdefault('half_sold_date', None)
+        h.setdefault('half_sold_price', None)
+        h.setdefault('half_sold_pnl', None)
+        # remaining_ratio 由 half_sold 派生，保持自洽（不信任文件里的旧值）
+        h['remaining_ratio'] = (1.0 - float(h['half_ratio'])) if h.get('half_sold') else 1.0
+        h.setdefault('closed_pnl_leg2', None)
         # 兼容旧读者：take_profit_pct 始终＝启动线
         h['take_profit_pct'] = h['trail_activate_pct']
     return portfolio
@@ -285,7 +350,8 @@ def portfolio_stats() -> Dict[str, Any]:
     if not closed:
         return {'total': 0, 'wins': 0, 'losses': 0, 'win_rate': None,
                 'avg_pnl': None, 'take_profits': 0, 'stop_losses': 0,
-                'time_stops': 0, 'avg_days_held': None}
+                'time_stops': 0, 'avg_days_held': None, 'half_exits': 0,
+                'ma20_exits': 0}
     wins = [h for h in closed if h['closed_pnl'] > 0]
     losses = [h for h in closed if h['closed_pnl'] <= 0]
     held = [h['closed_days_held'] for h in closed
@@ -295,11 +361,15 @@ def portfolio_stats() -> Dict[str, Any]:
         'wins': len(wins),
         'losses': len(losses),
         'win_rate': round(len(wins) / len(closed) * 100, 1),
+        # ⚠️ avg_pnl 用 closed_pnl（已减半的持仓＝加权总收益），口径与「1 笔」一致
         'avg_pnl': round(sum(h['closed_pnl'] for h in closed) / len(closed), 2),
         'take_profits': len([h for h in closed if h.get('close_reason') == 'take_profit']),
         'stop_losses': len([h for h in closed if h.get('close_reason') == 'stop_loss']),
         'time_stops': len([h for h in closed
                            if h.get('close_reason') in TIME_STOP_REASONS]),
+        # 🆕 破 MA20 清仓笔数 / 曾减半仓的笔数（含「减半后又破MA20」）
+        'ma20_exits': len([h for h in closed if h.get('close_reason') == 'ma20_exit']),
+        'half_exits': len([h for h in closed if h.get('half_sold')]),
         'avg_days_held': round(sum(held) / len(held), 1) if held else None,
     }
 
@@ -330,13 +400,19 @@ def market_fuse_check(index_pct_change: Optional[float],
                       enabled: Optional[bool] = None,
                       drop_pct: Optional[float] = None):
     """
-    大盘弱势熔断判定（只拦「时间止损」这类主动换仓动作，不拦止损/移动止盈）。
+    大盘弱势熔断判定。
+
+    ★ 作用范围（2026-09-22 起）＝ **只拦「破 MA10 减半」这一减仓动作** + 暂停补仓/新开仓：
+      - 均线离场中的「破 MA10 减半」是**状态型**信号 → 次日企稳会自动重判，不存在漏执行；
+        暴跌日个股普遍假破 MA10，暂缓一天的成本实测 ≈ 0（15 次暂缓中 4 次次日站回 = 避免假破）。
+      - **固定止损 −7%**（事件型：次日反弹则信号永久消失）与**破 MA20 清仓**（趋势硬底线）
+        **照常执行**，绝不拦 —— 实测拦它们会使收益 −0.13pt、最深浮亏恶化 0.23pt。
 
     - index_pct_change：基准指数当日涨跌幅（%），来自 fetch_market_review()['index_pct_change']
-    - None / NaN / 非法值 → **不熔断**（取数失败时不阻塞正常流程，宁可照常执行时间止损）
+    - None / NaN / 非法值 → **不熔断**（取数失败时不阻塞正常流程）
     - 返回 (是否熔断, 说明文案)
 
-    例：上证指数 -2.35% 且阈值 -2.0% → (True, '上证指数 -2.35%（≤-2.0%）→ 今日暂停时间止损…')
+    例：上证指数 -2.35% 且阈值 -2.0% → (True, '上证指数 -2.35%（≤-2.0%）→ 今日暂缓破MA10减半 + 暂停补仓…')
     """
     if enabled is None:
         enabled = MARKET_FUSE_ENABLED
@@ -353,26 +429,42 @@ def market_fuse_check(index_pct_change: Optional[float],
     if pct != pct:          # NaN 自比不相等
         return False, ''
     if pct <= drop_pct:
+        extra = '，并暂停补仓/新开仓' if MARKET_FUSE_BLOCK_REFILL else ''
         return True, (f'{MARKET_FUSE_INDEX} {pct:+.2f}%（≤{drop_pct:.1f}%）'
-                      f' → 今日暂停时间止损，持仓不动，大盘企稳后自动补执行')
+                      f' → 今日暂缓「破MA10减半」{extra}；'
+                      f'固定止损 −7% 与破MA20清仓照常执行，大盘企稳后自动补执行')
     return False, ''
 
 
 def mark_fused(evaluation: Dict, fuse_msg: str = '') -> Dict:
     """
-    把「已被时间止损判定命中、但因大盘熔断暂缓执行」的评估结果就地打标（返回同一对象）。
+    把「已被熔断范围内的信号命中、但因大盘熔断暂缓执行」的评估结果就地打标（返回同一对象）。
 
+    - 可拦范围 = FUSE_BLOCKABLE_TRIGGERS（破MA10减半 / 时间止损）
     - 加 `fused=True` / `fuse_reason`
-    - 状态文案改为 `🧟 僵尸股清理·熔断暂缓`，避免报告里看起来像已经清仓
+    - 状态文案改为 `✂️ 破MA10 减半·熔断暂缓`，避免报告里看起来像已经减仓
     """
     reason = evaluation.get('trigger')
-    if reason in TIME_STOP_REASONS:
+    if reason in FUSE_BLOCKABLE_TRIGGERS:
         evaluation['fused'] = True
         evaluation['fuse_reason'] = fuse_msg
         key = FUSE_STATUS_KEY.get(reason)
         if key:
             evaluation['status_text'] = STATUS_TEXT[key]
     return evaluation
+
+
+def fuse_blocks(action: str, fused: bool) -> bool:
+    """★ 单一协调入口：判断某类离场动作当天是否被熔断拦下。
+
+    action 取 'stop_loss' / 'ma20_exit' / 'take_profit' / 'ma10_half' / 'time_stop_*'。
+    只有 FUSE_BLOCKABLE_TRIGGERS 内的动作（破MA10减半 / 时间止损）才可能被拦
+    → 固定止损与破MA20清仓**永远返回 False**。
+    （供上层与测试直接断言「熔断不会吞掉风控动作」，不必读实现细节。）
+    """
+    if not fused:
+        return False
+    return action in FUSE_BLOCKABLE_TRIGGERS
 
 
 def _time_stop_check(days_held: int, peak_high_pnl: Optional[float]) -> Optional[str]:
@@ -410,28 +502,33 @@ def _time_stop_hint(days_held: int, peak_high_pnl: Optional[float],
 
 def evaluate_holding(holding: Dict, current_price: float,
                      day_high: Optional[float] = None,
-                     day_low: Optional[float] = None) -> Optional[Dict]:
+                     day_low: Optional[float] = None,
+                     ma10: Optional[float] = None,
+                     ma20: Optional[float] = None,
+                     fused: bool = False) -> Optional[Dict]:
     """
     评估单只持仓（纯计算，不落盘）。
 
-    触发规则（优先级从高到低）：
-    1. 止损：收盘盈亏 ≤ stop_loss_pct（默认 -7%）
-    2. 移动止盈：
-        1) 盈利（按盘中最高价）首次 ≥ trail_activate_pct（默认 +15%）→ 启动
-        2) 启动后 trail_high 取「盘中最高价 / 收盘价」的最大值（只上不下）
-        3) 触发线 = trail_high × (1 - trail_drawdown_pct/100)
-        4) 盘中最低价 ≤ 触发线 → 卖出，成交价＝触发线
-    3. 时间止损（仅未启动移动止盈时考核，清理僵尸股 / 低效股）：
-        - 🧟 僵尸股：持有 ≥ ZOMBIE_DAYS 交易日 且 期间最高涨幅 < ZOMBIE_PEAK_PCT
-        - 🐌 低效股：持有 ≥ INEFFICIENT_DAYS 交易日 且 期间最高涨幅 < INEFFICIENT_PEAK_PCT
-    4. 警戒：盈利 ≥ WARNING_PROFIT_PCT（默认 +10%）且尚未启动，一次性提醒
+    ★ 离场决策树（判定价 = **当日收盘价**；顺序固定，保证可复现）：
+      ① 固定止损  收盘盈亏 ≤ stop（默认 -7%）              → 全部清仓｜熔断**不拦**
+      ② 破 MA20   收盘价 < MA20                            → 全部清仓（含已减半的剩余仓位）｜熔断**不拦**
+      ③ 移动止盈  浮盈首破 +15% 启动 → 峰值回撤 8%         → 全部清仓｜TRAIL_ENABLED=False 时整段跳过
+      ④ 破 MA10   收盘价 < MA10 且**尚未减半**             → 卖出 50%｜**熔断可暂缓一天**
+      ⑤ 时间止损  僵尸 / 低效股                            → 全部清仓｜TIME_STOP_ENABLED=False 时整段跳过
+      ⑥ 半仓持有  已减半且未触及其它闸门                    → 只标记，不动作
+      ⑦ 警戒      浮盈 ≥ +10% 且尚未启动移动止盈 → 一次性提醒
 
+    ma10 / ma20：收盘均线（None / NaN / ≤0 → **该闸门本次不生效**，退化为只走其余闸门）
+    fused：当日大盘熔断是否生效 → 仅影响 ④（与时停，若启用）；①②③ **一律照常执行**
     day_high / day_low：当日盘中最高/最低价（缺省时退化为用收盘价判断）
 
     返回 dict；无有效行情时返回 None。
-    额外返回（供调用方落盘）：
+    额外返回（供调用方落盘/渲染）：
       trail_active / trail_high / trail_started（本次是否新启动）
-      exit_price / exit_pnl_pct（触发卖出时的成交价与盈亏）
+      exit_price / exit_pnl_pct（触发**全部清仓**时的成交价与盈亏）
+      half_price / half_pnl_pct（触发**减半仓**时的成交价与盈亏）
+      is_full_exit / is_half_exit / fused（本次动作类型）
+      weighted_pnl_pct（若此刻清仓的**加权总收益**：已减半则 0.5×半仓段 + 0.5×当前段）
     """
     buy = _to_float(holding.get('buy_price'))
     if buy <= 0 or current_price is None or _to_float(current_price) <= 0:
@@ -450,10 +547,29 @@ def evaluate_holding(holding: Dict, current_price: float,
                 or TRAIL_ACTIVATE_PCT)
     drawdown = _to_float(holding.get('trail_drawdown_pct')) or TRAIL_DRAWDOWN_PCT
 
+    def _valid(v: Any) -> Optional[float]:
+        """均线有效性：None/NaN/≤0 一律视为「该闸门本次不生效」"""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if f != f or f <= 0:
+            return None
+        return f
+
+    ma10 = _valid(ma10)
+    ma20 = _valid(ma20)
+
+    # ---- 半仓状态 ----
+    half_ratio = _to_float(holding.get('half_ratio')) or EXIT_MA_HALF_RATIO
+    half_ratio = min(max(half_ratio, 0.0), 1.0)
+    half_sold = bool(holding.get('half_sold'))
+    half_sold_pnl = holding.get('half_sold_pnl')
+    remaining_ratio = (1.0 - half_ratio) if half_sold else 1.0
+
     # ---- 时间止损相关字段 ----
     days_held = int(_to_float(holding.get('days_held')))
     peak_high = _to_float(holding.get('peak_high'))
-    # 当日最高价也要计入「期间最高」（首次观测即生效）
     if high > peak_high:
         peak_high = high
     peak_high_pnl = _pnl_pct(peak_high, buy) if peak_high > 0 else None
@@ -464,53 +580,82 @@ def evaluate_holding(holding: Dict, current_price: float,
     trail_started = False
     exit_price: Optional[float] = None
     exit_pnl_pct: Optional[float] = None
+    half_price: Optional[float] = None
+    half_pnl_pct: Optional[float] = None
+    fused_hit = False
+    taken = False
 
-    # ---- 1) 止损优先 ----
-    if pnl_pct <= stop:
+    # ---- ① 固定止损（事件型；熔断永不拦）----
+    if EXIT_USE_STOP and pnl_pct <= stop:
         trigger = 'stop_loss'
         exit_price = round(current_price, 3)
         exit_pnl_pct = pnl_pct
-        trail_active = was_active          # 止损不动移动止盈状态
-        trail_high = trail_high or None
+        taken = True
 
-    else:
-        # ---- 2) 更新峰值 / 判断启动 ----
+    # ---- ② 破 MA20 清仓（趋势硬底线；含已减半的剩余仓位）----
+    if not taken and EXIT_USE_MA and ma20 is not None and current_price < ma20:
+        trigger = 'ma20_exit'
+        exit_price = round(current_price, 3)
+        exit_pnl_pct = pnl_pct
+        taken = True
+
+    # ---- ③ 移动止盈（默认停用，环境变量 TRAIL_ENABLED=1 可零成本回滚）----
+    if not taken and TRAIL_ENABLED:
         if not trail_active:
-            peak_pnl = _pnl_pct(max(high, current_price), buy)
-            if peak_pnl >= activate:
+            if _pnl_pct(max(high, current_price), buy) >= activate:
                 trail_active = True
                 trail_started = True
                 trail_high = max(high, current_price)
         else:
             trail_high = max(trail_high, high, current_price)
-
         if trail_active:
             trigger_price = round(trail_high * (1 - drawdown / 100), 3)
             if low <= trigger_price:
-                # 盘中触及回撤线 → 按触发价成交（移动止盈单口径）
                 trigger = 'take_profit'
                 exit_price = trigger_price
                 exit_pnl_pct = _pnl_pct(trigger_price, buy)
+                taken = True
             elif current_price <= trigger_price:
-                # 收盘已跌破触发线（保护性兜底）
                 trigger = 'take_profit'
                 exit_price = round(current_price, 3)
                 exit_pnl_pct = pnl_pct
-            else:
-                trigger = 'trailing'
+                taken = True
+
+    # ---- ④ 破 MA10 减半（节奏型；熔断可暂缓一天）----
+    if not taken and EXIT_USE_MA and not half_sold and ma10 is not None and current_price < ma10:
+        trigger = 'ma10_half'
+        if fused:
+            fused_hit = True              # 暂缓：本日不执行减半，次日自然重判
         else:
-            # ---- 3) 时间止损（未启动移动止盈才考核）----
-            ts_reason = _time_stop_check(days_held, peak_high_pnl)
-            if ts_reason:
-                trigger = ts_reason
+            half_price = round(current_price, 3)
+            half_pnl_pct = pnl_pct
+        taken = True
+
+    # ---- ⑤ 时间止损（默认停用；仅未减半时考核）----
+    if not taken and TIME_STOP_ENABLED and not half_sold:
+        ts_reason = _time_stop_check(days_held, peak_high_pnl)
+        if ts_reason:
+            trigger = ts_reason
+            if fused:
+                fused_hit = True
+            else:
                 exit_price = round(current_price, 3)
                 exit_pnl_pct = pnl_pct
-            elif pnl_pct >= WARNING_PROFIT_PCT and not holding.get('alerted'):
-                trigger = 'warning'
-            else:
-                trigger = 'normal'
+            taken = True
 
-    # ---- 3) 汇总 ----
+    # ---- ⑥⑦ 无动作场景：半仓持有 / 移动止盈中 / 警戒 / 正常 ----
+    if not taken:
+        if half_sold:
+            trigger = 'half_holding'
+        elif TRAIL_ENABLED and trail_active:
+            trigger = 'trailing'
+        elif TRAIL_ENABLED and pnl_pct >= WARNING_PROFIT_PCT and not holding.get('alerted'):
+            # ⚠️ 警戒只在移动止盈启用时有意义（否则「接近启动线」无从谈起）
+            trigger = 'warning'
+        else:
+            trigger = 'normal'
+
+    # ---- 汇总 ----
     if trail_active and trail_high:
         trail_trigger_price = round(trail_high * (1 - drawdown / 100), 3)
         trail_peak_pnl = _pnl_pct(trail_high, buy)
@@ -521,6 +666,16 @@ def evaluate_holding(holding: Dict, current_price: float,
         trail_peak_pnl = None
         distance_to_trail = None
         distance_to_take_profit = round(activate - pnl_pct, 2)   # 未启动 → 距启动线
+
+    # 加权总收益（一笔交易的真实口径：减半段 + 剩余段）
+    if half_sold and half_sold_pnl is not None:
+        weighted_pnl = round(_to_float(half_sold_pnl) * half_ratio + pnl_pct * remaining_ratio, 2)
+    else:
+        weighted_pnl = pnl_pct
+
+    # 熔断暂缓 → 状态文案改用「…·熔断暂缓」，避免报告里看起来已经减仓/清仓
+    status_text = STATUS_TEXT.get(
+        FUSE_STATUS_KEY.get(trigger, trigger) if fused_hit else trigger, '')
 
     return {
         'code': holding['code'],
@@ -533,10 +688,31 @@ def evaluate_holding(holding: Dict, current_price: float,
         'day_low': round(low, 3),
         'pnl_pct': pnl_pct,
         'trigger': trigger,
-        'status_text': STATUS_TEXT.get(trigger, ''),
+        'status_text': status_text,
+        # 动作类型（供上层单点判断）
+        'is_full_exit': (trigger in FULL_EXIT_REASONS) and not fused_hit,
+        'is_half_exit': (trigger in HALF_EXIT_REASONS) and not fused_hit,
+        'fused': fused_hit,
+        'fuse_reason': '',
         # 止损
         'stop_loss_pct': stop,
         'distance_to_stop_loss': round(pnl_pct - stop, 2),
+        # 均线离场（🆕）
+        'ma10': round(ma10, 3) if ma10 else None,
+        'ma20': round(ma20, 3) if ma20 else None,
+        'ma10_breached': bool(ma10 is not None and current_price < ma10),
+        'ma20_breached': bool(ma20 is not None and current_price < ma20),
+        'ma10_gap_pct': (round((current_price / ma10 - 1) * 100, 2) if ma10 else None),
+        'ma20_gap_pct': (round((current_price / ma20 - 1) * 100, 2) if ma20 else None),
+        # 半仓（🆕）
+        'half_sold': half_sold,
+        'half_ratio': round(half_ratio, 3),
+        'remaining_ratio': round(remaining_ratio, 3),
+        'half_sold_price': holding.get('half_sold_price'),
+        'half_sold_pnl': half_sold_pnl,
+        'half_price': half_price,
+        'half_pnl_pct': half_pnl_pct,
+        'weighted_pnl_pct': weighted_pnl,
         # 移动止盈
         'trail_activate_pct': activate,
         'trail_drawdown_pct': drawdown,
@@ -592,6 +768,21 @@ def make_status_placeholder(holding: Dict, current_price: float = 0.0,
         'distance_to_trail': None,
         'distance_to_take_profit': 0.0,
         'exit_price': None, 'exit_pnl_pct': None,
+        # 动作类型 / 熔断（占位场景不动作）
+        'is_full_exit': False, 'is_half_exit': False,
+        'fused': False, 'fuse_reason': '',
+        # 均线离场（无行情 → 无均线可判）
+        'ma10': None, 'ma20': None, 'ma10_breached': False, 'ma20_breached': False,
+        'ma10_gap_pct': None, 'ma20_gap_pct': None,
+        # 半仓
+        'half_sold': bool(holding.get('half_sold')),
+        'half_ratio': _to_float(holding.get('half_ratio')) or EXIT_MA_HALF_RATIO,
+        'remaining_ratio': ((1.0 - (_to_float(holding.get('half_ratio')) or EXIT_MA_HALF_RATIO))
+                            if holding.get('half_sold') else 1.0),
+        'half_sold_price': holding.get('half_sold_price'),
+        'half_sold_pnl': holding.get('half_sold_pnl'),
+        'half_price': None, 'half_pnl_pct': None,
+        'weighted_pnl_pct': 0.0,
         # 时间止损（占位场景不提示，避免误导）
         'days_held': _hold_days(holding),
         'peak_high': (_to_float(holding.get('peak_high')) or None),
@@ -644,6 +835,13 @@ def add_to_portfolio(code: str, name: str, buy_price: float,
         'entry_pending': True,
         'shares': 0,
         'stop_loss_pct': float(stop_loss_pct),
+        'half_ratio': EXIT_MA_HALF_RATIO,   # 🆕 破 MA10 减半比例
+        'half_sold': False,                 # 🆕 是否已减半
+        'half_sold_at': None,
+        'half_sold_date': None,
+        'half_sold_price': None,
+        'half_sold_pnl': None,
+        'remaining_ratio': 1.0,             # 🆕 剩余仓位比例
         'trail_activate_pct': float(trail_activate_pct),
         'trail_drawdown_pct': float(trail_drawdown_pct),
         'trail_active': False,
@@ -659,6 +857,7 @@ def add_to_portfolio(code: str, name: str, buy_price: float,
         'closed_price': None,
         'closed_pnl': None,
         'close_reason': None,
+        'closed_pnl_leg2': None,            # 🆕 最后一段（未减半时=全仓）收益%
         'closed_peak_pnl': None,
         'closed_days_held': None,
         'source': source,
@@ -666,7 +865,7 @@ def add_to_portfolio(code: str, name: str, buy_price: float,
     holdings.append(holding)
     save_portfolio(portfolio)
     print(f'  ➕ 加入持仓池: {name}({code}) 参考价 {buy_price:.2f} '
-          f'止损{stop_loss_pct}% / 移动止盈启动+{trail_activate_pct}%（回撤{trail_drawdown_pct}%）'
+          f'止损{stop_loss_pct}% / 破MA{EXIT_MA_HALF}减半 / 破MA{EXIT_MA_CLEAR}清仓'
           f'（来源：{source}）')
     return holding
 
@@ -862,20 +1061,69 @@ def update_trail_states(states: List[Dict]) -> int:
     return updated
 
 
+def apply_half_exit(code: str, price: float, pnl_pct: float,
+                    date_str: Optional[str] = None,
+                    ratio: Optional[float] = None) -> Optional[Dict]:
+    """
+    执行「破 MA10 减半仓」的**部分平仓**（幂等：已减半 → 直接返回 None，不重复扣减）。
+
+    - 记录 half_sold / half_sold_at / half_sold_date / half_sold_price / half_sold_pnl
+    - remaining_ratio = 1 − half_ratio
+    - ⚠️ **不修改 buy_price** ⇒ 固定止损 −7% 仍以**原始成本**为基准（不是移动止损）
+    - ⚠️ **不关仓**：该票仍是活跃持仓，继续占用 1 个名额；用户拍板「破 MA10 后不补仓」
+    返回被减半的 holding（未减半 / 已减半过 / 未找到 → None）
+    """
+    code = str(code).zfill(6)
+    ratio = EXIT_MA_HALF_RATIO if ratio is None else float(ratio)
+    ratio = min(max(ratio, 0.0), 1.0)
+    portfolio = load_portfolio()
+    target = None
+    for h in portfolio.get('holdings', []):
+        if h['code'] == code and not h.get('closed'):
+            if h.get('half_sold'):
+                print(f'  ⏭️ {h.get("name")}({code}) 已减半仓，跳过（幂等）')
+                return None
+            h['half_sold'] = True
+            h['half_ratio'] = ratio
+            h['remaining_ratio'] = round(1.0 - ratio, 3)
+            h['half_sold_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            h['half_sold_date'] = _fmt_date(date_str) if date_str else None
+            h['half_sold_price'] = round(float(price), 3)
+            h['half_sold_pnl'] = round(float(pnl_pct), 2)
+            target = h
+            break
+    if target:
+        save_portfolio(portfolio)
+    return target
+
+
 def close_holding(code: str, pnl_pct: float, reason: str = 'stop_loss',
                   price: Optional[float] = None,
                   peak_pnl: Optional[float] = None,
                   days_held: Optional[int] = None) -> Optional[Dict]:
-    """标记某只持仓已止盈/止损/时间止损出场。返回被平仓的 holding（未找到则 None）"""
+    """标记某只持仓已清仓出场（全平）。返回被平仓的 holding（未找到则 None）
+
+    ★ 统计口径（2026-09-22）：若该持仓曾「破 MA10 减半」，则 `closed_pnl` 记录
+      **加权总收益** = half_ratio × 半仓段 + (1 − half_ratio) × 最后一段；
+      另存 `closed_pnl_leg2`（最后一段）与 `half_sold_pnl`（半仓段）留痕。
+      ⇒ 一笔「减半 + 后续清仓」合并为 **1 笔**，胜率 / 均值口径不失真。
+    """
     code = str(code).zfill(6)
     portfolio = load_portfolio()
     target = None
     for h in portfolio.get('holdings', []):
         if h['code'] == code and not h.get('closed'):
+            leg2 = round(float(pnl_pct), 2)
             h['closed'] = True
             h['closed_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             h['closed_price'] = round(float(price), 3) if price else None
-            h['closed_pnl'] = round(float(pnl_pct), 2)
+            h['closed_pnl_leg2'] = leg2
+            if h.get('half_sold') and h.get('half_sold_pnl') is not None:
+                r = _to_float(h.get('half_ratio')) or EXIT_MA_HALF_RATIO
+                r = min(max(r, 0.0), 1.0)
+                h['closed_pnl'] = round(_to_float(h['half_sold_pnl']) * r + leg2 * (1.0 - r), 2)
+            else:
+                h['closed_pnl'] = leg2
             h['close_reason'] = reason
             if peak_pnl is not None:
                 h['closed_peak_pnl'] = round(float(peak_pnl), 2)
@@ -914,30 +1162,46 @@ if __name__ == '__main__':
         portfolio = load_portfolio()
         active = get_active_holdings()
         print(f'\n📂 当前持仓池（活跃 {len(active)}/{MAX_HOLDINGS}）：')
+        print(f'   离场规则：止损{EXIT_STOP_LOSS_PCT}% ｜ 破MA{EXIT_MA_HALF}减半 ｜ 破MA{EXIT_MA_CLEAR}清仓'
+              f' ｜ 熔断(≤{MARKET_FUSE_DROP_PCT}%)只拦MA{EXIT_MA_HALF}减半'
+              f' ｜ 移动止盈{"启用" if TRAIL_ENABLED else "停用"}'
+              f' ｜ 时间止损{"启用" if TIME_STOP_ENABLED else "停用"}')
         for h in active:
-            flag = '⏳待归一化' if h.get('entry_pending') else '🟢已建仓'
-            trail = (f"移动止盈中 峰值{h.get('trail_high')}" if h.get('trail_active')
-                     else f"移动止盈待启动(+{h.get('trail_activate_pct')}%)")
+            if h.get('entry_pending'):
+                flag = '⏳待归一化'
+            else:
+                flag = '◐已减半' if h.get('half_sold') else '🟢满仓'
             clock = ''
             if not h.get('entry_pending'):
                 peak = _to_float(h.get('peak_high'))
                 peak_txt = (f" 期间最高{peak:.2f}({_pnl_pct(peak, _to_float(h['buy_price'])):+.1f}%)"
                             if peak > 0 else '')
                 clock = f" 持有{int(_to_float(h.get('days_held')))}日{peak_txt}"
+                if h.get('half_sold'):
+                    clock += (f" ｜ 半仓段{_to_float(h.get('half_sold_pnl')):+.2f}%"
+                              f"@{h.get('half_sold_price')}({h.get('half_sold_date')})")
             print(f"  {flag} {h['name']}({h['code']}) @ {h['buy_price']} "
-                  f"止损{h['stop_loss_pct']}% / {trail}{clock} 来源={h.get('source')}")
+                  f"止损{h['stop_loss_pct']}% / 破MA{EXIT_MA_HALF}减半 / 破MA{EXIT_MA_CLEAR}清仓"
+                  f"{clock} 来源={h.get('source')}")
         recent = get_recent_closed_holdings(5)
         if recent:
             print(f'\n📜 最近平仓（{len(recent)} 条）：')
             for h in recent:
                 peak = h.get('closed_peak_pnl')
                 peak_txt = f" 峰值{peak:+.2f}%" if peak is not None else ''
+                half_txt = ''
+                if h.get('half_sold'):
+                    half_txt = (f"（加权：半仓段{h.get('half_sold_pnl'):+.2f}% ×{h.get('half_ratio')}"
+                                f" + 尾段{h.get('closed_pnl_leg2'):+.2f}%）")
                 print(f"  [{h.get('close_reason')}] {h['name']}({h['code']}) "
-                      f"{h.get('closed_pnl'):+.2f}%{peak_txt} @ {h.get('closed_at')}")
+                      f"{h.get('closed_pnl'):+.2f}%{half_txt}{peak_txt} @ {h.get('closed_at')}")
         stats = portfolio_stats()
         if stats['total']:
             print(f"\n📊 累计战绩：{stats['total']} 笔，胜率 {stats['win_rate']}%，"
-                  f"平均 {stats['avg_pnl']:+.2f}%")
+                  f"平均 {stats['avg_pnl']:+.2f}% ｜ 止损 {stats['stop_losses']} / "
+                  f"破MA{EXIT_MA_CLEAR}清仓 {stats['ma20_exits']} / 含减半 {stats['half_exits']}")
+            if stats['avg_days_held'] is not None:
+                print(f"   平均持有 {stats['avg_days_held']} 个交易日")
     elif arg == 'clear':
         clear_portfolio()
         print('🧹 持仓池已清空')
