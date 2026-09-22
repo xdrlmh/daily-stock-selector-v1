@@ -433,8 +433,111 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
     }
 
 
-def generate_outlook(market: Dict[str, Any], sector_heat: List[Dict]) -> List[str]:
-    """根据大盘趋势与板块温度生成『明日展望』要点"""
+def _sector_leaders_outlook(leaders: Dict[str, List[Dict]]) -> List[str]:
+    """三榜（涨幅 / 资金 / 涨停）→ 明日展望要点。
+
+    【任务②】三条独立陈述，避免把「资金榜第一」说成「情绪第一」；
+    若三榜头名不一致，额外点明这是轮动特征（只报一个混合名次会误导）。
+    """
+    lines = []
+    g = leaders.get('gainers') or []
+    f = leaders.get('flows') or []
+    u = leaders.get('limit_ups') or []
+    g0 = g[0] if g else None
+    f0 = f[0] if f else None
+    u0 = u[0] if u else None
+
+    if g0 is not None:
+        lines.append(
+            f'- 涨幅领先：**{g0["theme"]}**（平均 {g0["avg_pct"]:+.1f}%，{g0["cnt"]} 只成分）'
+            f' → 关注该板块内**强势股的次日溢价**'
+        )
+    if f0 is not None:
+        fy = safe_float(f0.get('inflow_yi'))
+        if fy is None:
+            lines.append(f'- 资金榜头名：**{f0["theme"]}**（主力流入数据缺失）')
+        elif fy > 0:
+            lines.append(
+                f'- 主力资金聚焦：**{f0["theme"]}**（{fy:+.1f}亿，平均 {f0["avg_pct"]:+.1f}%）'
+                f' → 资金与情绪同向，可优先跟踪'
+            )
+        else:
+            lines.append(
+                f'- ⚠️ 资金榜头名 **{f0["theme"]}** 仍为**净流出 {abs(fy):.1f}亿** → '
+                f'全市场无板块呈净流入，情绪强于资金，追高需谨慎'
+            )
+    if u0 is not None and u0.get('limit_up', 0) > 0:
+        lines.append(
+            f'- 涨停家数最多：**{u0["theme"]}**（{u0["limit_up"]} 只，平均 {u0["avg_pct"]:+.1f}%）'
+            f' → 短线情绪最集中处，注意**分歧转一致**的节奏'
+        )
+
+    names = [x['theme'] for x in (g0, f0, u0) if x is not None]
+    if len(set(names)) > 1:
+        lines.append(
+            f'- 三榜头名不一致（{" / ".join(names)}）→ 属**板块轮动**特征，宜分散跟踪、不宜单押'
+        )
+    return lines
+
+
+def _render_sector_leaders(leaders: Dict[str, List[Dict]]) -> List[str]:
+    """三榜 → markdown 行。
+
+    推送版与落盘版**共用同一实现**（2026-09-15 曾因双份实现只改一处而漏配色）。
+    """
+    def _row(i, item, main_txt, sub_txt):
+        medal = ['🥇', '🥈', '🥉'][i] if i < 3 else str(i + 1)
+        return f'- {medal} **{item["theme"]}** - {main_txt} ｜ {sub_txt}'
+
+    out = ['## 🔥 板块三榜', '']
+    gainers = leaders.get('gainers') or []
+    if gainers:
+        out.append('**📈 涨幅榜**')
+        for i, it in enumerate(gainers):
+            out.append(_row(
+                i, it,
+                f'{pct_color(it.get("avg_pct"))}平均涨幅 {format_num(it.get("avg_pct"), "+.2f", "%")}',
+                f'{it.get("cnt", 0)} 只成分'))
+        out.append('')
+
+    flows = leaders.get('flows') or []
+    if flows:
+        out.append('**💰 资金榜**')
+        for i, it in enumerate(flows):
+            out.append(_row(
+                i, it,
+                f'主力 {format_num(it.get("inflow_yi"), "+.1f", "亿")}',
+                f'{pct_color(it.get("avg_pct"))}平均涨幅 {format_num(it.get("avg_pct"), "+.2f", "%")}'))
+        out.append('')
+
+    ups = leaders.get('limit_ups') or []
+    if ups:
+        out.append('**🚀 涨停榜**')
+        for i, it in enumerate(ups):
+            out.append(_row(
+                i, it,
+                f'涨停 **{it.get("limit_up", 0)}只**',
+                f'{pct_color(it.get("avg_pct"))}平均涨幅 {format_num(it.get("avg_pct"), "+.2f", "%")}'))
+        out.append('')
+
+    cov = leaders.get('coverage') or {}
+    if cov:
+        note = (f'覆盖 {cov.get("tagged", 0)}/{cov.get("total", 0)} 只'
+                f'（{cov.get("ratio", 0)}%）｜ {cov.get("n_sector", 0)} 个板块')
+        if cov.get('industry_downgraded'):
+            note += ' ｜ ⚠️ 行业兜底不可用，已回退纯题材匹配'
+        out.append(f'> 口径：三榜**独立排序**（涨幅 / 主力净流入 / 涨停家数），不再混合加权。{note}')
+    out.append('')
+    return out
+
+
+def generate_outlook(market: Dict[str, Any], sector_heat: List[Dict],
+                     sector_leaders: Dict[str, List[Dict]] = None) -> List[str]:
+    """根据大盘趋势与板块方向生成『明日展望』要点。
+
+    【任务②】传了 sector_leaders 就走三榜逻辑（涨幅/资金/涨停分别陈述），
+    否则回退旧的混合强度榜逻辑（向后兼容）。
+    """
     lines = []
     trend = market.get('trend_60d', 'unknown')
     main_yi = market.get('main_net_inflow_yi')
@@ -460,12 +563,16 @@ def generate_outlook(market: Dict[str, Any], sector_heat: List[Dict]) -> List[st
         else:
             lines.append(f'- 主力资金**大幅流出**（{main_yi:+.0f}亿），谨防踩踏')
 
-    # 3) 板块温度头部
-    # ⚠️ sector_heat 按「强度分」排序（= 平均涨幅*0.4 + 主力流入*0.3 + 涨停数*0.3），
+    # 3) 板块方向
+    # 【任务②】优先用三榜（涨幅/资金/涨停 独立排序，口径透明、无参数争议）；
+    #          未传三榜时回退旧的混合强度榜（向后兼容）。
+    if sector_leaders:
+        lines.extend(_sector_leaders_outlook(sector_leaders))
+    # ⚠️ 旧路径：sector_heat 按「强度分」排序（= 平均涨幅*0.4 + 主力流入*0.3 + 涨停数*0.3），
     #    并不等价于「资金净流入方向」。若无条件写"资金聚焦 X"，会出现
     #    X 实际主力净流出却被描述成资金流入的误导（2026-09-15 用户截图暴露：
     #    半导体 温度第 1，但主力 -18.3 亿）。故按 top 的资金方向分三种措辞。
-    if sector_heat:
+    elif sector_heat:
         top = sector_heat[0]
         top_theme = top.get('theme', '未知')
         top_yi = safe_float(top.get('inflow_yi'))
@@ -730,6 +837,7 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
                             warnings: pd.DataFrame, all_stocks: pd.DataFrame,
                             market: Dict[str, Any] = None,
                             sector_heat: List[Dict] = None,
+                            sector_leaders: Dict[str, List[Dict]] = None,
                             holdings_status: List[Dict] = None,
                             closed_today: List[Dict] = None,
                             new_positions: List[Dict] = None,
@@ -742,7 +850,7 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
     - 大盘复盘（指数/主力/趋势/成交额/市场情绪）
     - 💼 模拟盘持仓（移动止盈结算 + 自动补仓结果）—— 已合并原「持仓监控」
     - 今日强势股 TOP5（收盘后五维评分重筛）
-    - 板块温度 TOP3（按题材聚合力强板块）
+    - 板块三榜（【任务②】涨幅 / 主力资金 / 涨停家数，独立排序）
     - 明日展望
     """
     lines = []
@@ -812,8 +920,10 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
             )
         lines.append('')
 
-    # ---- 板块温度 TOP3 ----
-    if sector_heat:
+    # ---- 板块方向（【任务②】三榜优先；未传三榜则回退旧混合榜）----
+    if sector_leaders:
+        lines.extend(_render_sector_leaders(sector_leaders))
+    elif sector_heat:
         lines.append('## 🔥 板块温度 TOP3')
         lines.append('')
         for i, sector in enumerate(sector_heat, 1):
@@ -832,7 +942,7 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
     # ---- 明日展望 ----
     lines.append('## 💡 明日展望')
     lines.append('')
-    outlook = generate_outlook(market or {}, sector_heat or [])
+    outlook = generate_outlook(market or {}, sector_heat or [], sector_leaders)
     for o in outlook:
         lines.append(o)
     lines.append('')
@@ -879,7 +989,7 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
     lines.append('')
     lines.append('| 维度 | 权重 | 评分要点 |')
     lines.append('|---|---|---|')
-    lines.append('| 技术面 | 25% | 当日涨幅、5日涨幅、量比 |')
+    lines.append('| 技术面 | 25% | 当日涨幅、5日涨幅、60日趋势、量比、**趋势线(MA120)** |')
     lines.append('| 资金面 | 20% | 主力净流入、换手率 |')
     lines.append('| 估值 | 15% | PE-TTM、PB |')
     lines.append('| 题材催化 | 15% | 热门主题、当日关注度 |')
@@ -976,6 +1086,7 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
                        warnings: pd.DataFrame, all_stocks: pd.DataFrame,
                        market: Dict[str, Any] = None,
                        sector_heat: List[Dict] = None,
+                       sector_leaders: Dict[str, List[Dict]] = None,
                        reports_dir: Path = None,
                        holdings_status: List[Dict] = None,
                        closed_today: List[Dict] = None,
@@ -1049,8 +1160,10 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
             lines.append('</details>')
             lines.append('')
 
-    # 板块温度
-    if sector_heat:
+    # 板块方向（【任务②】三榜优先；未传三榜则回退旧混合榜）
+    if sector_leaders:
+        lines.extend(_render_sector_leaders(sector_leaders))
+    elif sector_heat:
         lines.append('## 🔥 板块温度 TOP3')
         lines.append('')
         for i, sector in enumerate(sector_heat, 1):
@@ -1069,7 +1182,7 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
     # 明日展望
     lines.append('## 💡 明日展望')
     lines.append('')
-    outlook = generate_outlook(market or {}, sector_heat or [])
+    outlook = generate_outlook(market or {}, sector_heat or [], sector_leaders)
     for o in outlook:
         lines.append(o)
     lines.append('')
