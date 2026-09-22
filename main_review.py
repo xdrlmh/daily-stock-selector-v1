@@ -36,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.config import TEST_ONLY, REPORTS_DIR, validate_config
 from src.data_fetcher import (
     fetch_market_spot, fetch_fund_flow_rank,
-    filter_main_board, enrich_with_fund_flow,
+    filter_main_board, enrich_with_fund_flow, merge_capital,
     fetch_market_review, merge_ma_panel, fetch_ma_map,
 )
 from src.selector import screen_stocks, analyze_sector_heat, analyze_sector_leaders
@@ -273,16 +273,17 @@ def main():
         log.error('行情数据抓取失败（已尝试逐日回退），退出')
         sys.exit(1)
 
-    fund_df = fetch_fund_flow_rank()
-
-    # 3. 过滤主板非ST + 合并资金流
+    # 3. 过滤主板非ST
     main_board = filter_main_board(spot_df)
     log.info(f'主板非ST候选：{len(main_board)} 只')
-    enriched = enrich_with_fund_flow(main_board, fund_df)
-    log.info(f'合并资金流后：{len(enriched)} 只')
 
-    # 3.5 合并均线面板（趋势线 MA120）—— 取不到数据时原样返回，技术面自动退回原口径
-    enriched = merge_ma_panel(enriched)
+    # 3.5 合并均线面板（趋势线 MA120 + 离场均线）—— 顺带缓存成交额矩阵，
+    #     供资金面占比分母复用（**零额外取数**）
+    enriched = merge_ma_panel(main_board)
+
+    # 3.6 合并资金面（新口径：超大单 5日/60日 趋势面板；legacy：当日主力净流入）
+    enriched = merge_capital(enriched)
+    log.info(f'合并均线 + 资金面后：{len(enriched)} 只')
 
     # 4. 大盘复盘数据（含实际数据日期）
     market = fetch_market_review()
