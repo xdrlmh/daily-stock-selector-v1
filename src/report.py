@@ -54,6 +54,24 @@ except ImportError:  # 兼容以顶层模块方式导入
         MARKET_FUSE_BLOCK_REFILL as _MARKET_FUSE_BLOCK_REFILL,
     )
 
+# 资金面口径（'elg' = 超大单 5日/60日 趋势；'legacy' = 当日主力净流入）
+try:
+    from src.config import CAPITAL_MODE
+except ImportError:      # 兼容以顶层模块方式导入
+    from config import CAPITAL_MODE
+
+
+# TOP 表第 7 列列名（新口径 = 超大单占比 / legacy = 当日主力净额）—— 模块级，
+# 早上选股与盘后复盘两张表共用，避免函数内局部变量跨函数引用
+ELG_HEAD = '超大单占比' if CAPITAL_MODE == 'elg' else '主力净额'
+
+
+def screen_footnote() -> str:
+    """筛选口径脚注（随 CAPITAL_MODE 变化，保证回退路径文案不变）"""
+    if CAPITAL_MODE == 'elg':
+        return '> 🎯 筛选：主板非ST / 趋势向上 / 超大单5日日均>60日日均'
+    return '> 🎯 筛选：主板非ST / 趋势向上 / 主力流入'
+
 
 def format_price(price: float) -> str:
     if pd.isna(price):
@@ -120,6 +138,110 @@ def format_mcap_yi(mcap) -> str:
     return f'{v / 1e8:.1f}亿'
 
 
+# ============================================================
+# 资金面展示（2026-09-22 新口径：超大单 5日/60日 趋势 + 占比）
+# ============================================================
+def _yi(wan) -> str:
+    """万元 → 亿元字符串，并消除「-0.00」（负零在报告里会被误读为净流出）"""
+    y = round(float(wan or 0.0) / 1e4, 2)
+    if y == 0:
+        y = 0.0
+    return f'{y:+.2f}亿'
+
+
+def elg_cell(row) -> str:
+    """TOP 表格「超大单占比」列：近 5 日超大单净额 / 近 5 日成交额（%）。
+
+    `CAPITAL_MODE=legacy` → 退回原「主力净额」（亿），保证回退路径展示不变。
+    """
+    if CAPITAL_MODE != 'elg':
+        return format_yi(row.get('main_net_inflow', 0))
+    v = safe_float(row.get('elg_ratio_5d'))
+    if v is None:
+        return '-'
+    return f'{v:+.2f}%'
+
+
+def elg_cell_color(row) -> str:
+    """「超大单占比」列的配色（A 股惯例：正=🔴 / 负=🟢）"""
+    if CAPITAL_MODE != 'elg':
+        return pct_color(row.get('main_net_inflow', 0))
+    return pct_color(safe_float(row.get('elg_ratio_5d')))
+
+
+def capital_short(row) -> str:
+    """一句话描述资金面（「今日重点」用，尽量短）。"""
+    if CAPITAL_MODE != 'elg':
+        return f'主力 {format_yi(row.get("main_net_inflow", 0))}流入'
+    v = safe_float(row.get('elg_5d_avg'))
+    if v is None:
+        return '资金面数据不足'
+    r = safe_float(row.get('elg_ratio_5d'))
+    ratio_txt = f'（占比{r:+.1f}%）' if r is not None else ''
+    e60 = safe_float(row.get('elg_60d_avg'))
+    if v > 0 and e60 is not None and v > e60:
+        return f'超大单持续流入 {_yi(v)}/日{ratio_txt}'
+    if v > 0:
+        return f'超大单流入 {_yi(v)}/日{ratio_txt}'
+    return f'⚠️超大单净流出 {_yi(v)}/日'
+
+
+def capital_state(row) -> str:
+    """资金面状态：'strong' / 'inflow' / 'outflow' / 'unknown'（按 CAPITAL_MODE 分派）。
+
+    ⚠️ legacy 分支的阈值（strong ≥ +1 亿、outflow < −0.5 亿）与改造前**逐字一致**，
+    保证 `CAPITAL_MODE=legacy` 回退时「总体策略建议」的结论与旧版完全相同。
+    """
+    if CAPITAL_MODE != 'elg':
+        inflow_yi = (safe_float(row.get('main_net_inflow')) or 0.0) / 1e8
+        if inflow_yi >= 1:
+            return 'strong'
+        if inflow_yi < -0.5:
+            return 'outflow'
+        return 'inflow' if inflow_yi > 0 else 'unknown'
+
+    v = safe_float(row.get('elg_5d_avg'))
+    if v is None:
+        return 'unknown'
+    if v <= 0:
+        return 'outflow'
+    e60 = safe_float(row.get('elg_60d_avg'))
+    if e60 is not None and v > e60:
+        return 'strong'
+    return 'inflow'
+
+
+def capital_tips(row) -> List[str]:
+    """「操作指引」里的资金面子项（新口径：5日/60日趋势 + 占比强度）。"""
+    if CAPITAL_MODE != 'elg':
+        inflow_yi = (safe_float(row.get('main_net_inflow')) or 0.0) / 1e8
+        if inflow_yi >= 3:
+            return [f'主力强势介入(+{inflow_yi:.1f}亿)']
+        if inflow_yi >= 1:
+            return [f'主力净流入(+{inflow_yi:.1f}亿)']
+        if inflow_yi > 0:
+            return [f'主力温和流入(+{inflow_yi:.1f}亿)']
+        if inflow_yi > -0.5:
+            return [f'主力微流出({inflow_yi:.1f}亿)']
+        return [f'⚠️主力撤离({inflow_yi:.1f}亿)']
+
+    v = safe_float(row.get('elg_5d_avg'))
+    if v is None:
+        return ['资金面数据不足（次新/停牌）']
+    e60 = safe_float(row.get('elg_60d_avg'))
+    out = []
+    if v > 0 and e60 is not None and v > e60:
+        out.append(f'超大单持续流入(5日日均{_yi(v)} > 60日{_yi(e60)})')
+    elif v > 0:
+        out.append(f'超大单流入未放大(5日日均{_yi(v)})')
+    else:
+        out.append(f'⚠️超大单净流出(5日日均{_yi(v)})')
+    r = safe_float(row.get('elg_ratio_5d'))
+    if r is not None:
+        out.append(f'超大单占成交额{r:+.2f}%')
+    return out
+
+
 def generate_keystrokes(df: pd.DataFrame) -> List[str]:
     """生成「今日重点」3-5 条极简要点"""
     if df.empty:
@@ -128,10 +250,9 @@ def generate_keystrokes(df: pd.DataFrame) -> List[str]:
     points = []
     # 取 TOP 1
     top1 = df.iloc[0]
-    inflow1 = format_yi(top1.get('main_net_inflow', 0))
     points.append(
         f'🥇 龙头 {top1["name"]}({top1["code"]}) '
-        f'主力 {inflow1}流入，评分 {top1["total_score"]:.0f}'
+        f'{capital_short(top1)}，评分 {top1["total_score"]:.0f}'
     )
 
     # 涨停股
@@ -197,7 +318,7 @@ def generate_action_tips(row: pd.Series) -> str:
     """
     基于股票的具体属性，生成针对性的操作建议（不再千篇一律）。
     根据以下特征优先级生成建议：
-    1) 主力净流入强度
+    1) 资金面（新口径：超大单 5日/60日 趋势 + 占比；legacy：主力净流入强度）
     2) 当日涨幅（避免追高）
     3) PE 估值水平
     4) 换手率（活跃度/风险）
@@ -205,19 +326,8 @@ def generate_action_tips(row: pd.Series) -> str:
     """
     tips = []
 
-    # 1) 主力净流入信号
-    inflow = float(row.get('main_net_inflow', 0) or 0)
-    inflow_yi = inflow / 1e8
-    if inflow_yi >= 3:
-        tips.append(f'主力强势介入(+{inflow_yi:.1f}亿)')
-    elif inflow_yi >= 1:
-        tips.append(f'主力净流入(+{inflow_yi:.1f}亿)')
-    elif inflow_yi > 0:
-        tips.append(f'主力温和流入(+{inflow_yi:.1f}亿)')
-    elif inflow_yi > -0.5:
-        tips.append(f'主力微流出({inflow_yi:.1f}亿)')
-    else:
-        tips.append(f'⚠️主力撤离({inflow_yi:.1f}亿)')
+    # 1) 资金面信号（新口径：超大单 5日/60日 趋势 + 占比；legacy 退回主力净流入）
+    tips.extend(capital_tips(row))
 
     # 2) 当日涨幅
     pct = float(row.get('pct_change', 0) or 0)
@@ -256,12 +366,13 @@ def generate_action_tips(row: pd.Series) -> str:
     elif 3 <= turnover <= 10:
         tips.append(f'换手{turnover:.1f}%活跃健康')
 
-    # 5) 总体策略建议
+    # 5) 总体策略建议（资金面按 CAPITAL_MODE 分派；legacy 阈值与旧版逐字一致）
+    _cap = capital_state(row)
     if pct >= 9.5:
         conclusion = '不建议追高'
-    elif inflow_yi >= 1 and 0 < pct < 6 and pe < 50:
+    elif _cap == 'strong' and 0 < pct < 6 and pe < 50:
         conclusion = '可小仓试探'
-    elif inflow_yi < -0.5 or pct >= 6:
+    elif _cap == 'outflow' or pct >= 6:
         conclusion = '观望为主'
     else:
         conclusion = '回调时分批关注'
@@ -332,7 +443,7 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
     lines.append('')
     lines.append(f'> 📡 数据源：Tushare')
     lines.append(f'> 🕐 生成时间：{datetime.now().strftime("%H:%M")}')
-    lines.append(f'> 🎯 筛选：主板非ST / 趋势向上 / 主力流入')
+    lines.append(screen_footnote())
     lines.append('')
 
     # 大盘环境（基于上证指数）
@@ -351,14 +462,15 @@ def generate_dingtalk_payload(date_str: str, top_picks: pd.DataFrame,
     lines.append('')
 
     # TOP 表格（9 列宽表格：用户反馈此版更顺眼，钉钉手机端虽偶有堆叠但可读性更高）
+    # ⚠️ 第 7 列口径：新口径 = 超大单占比（近5日净额/近5日成交额）；legacy = 当日主力净额
     lines.append(f'## 📋 TOP {len(top_picks)} 精选')
     lines.append('')
     if not top_picks.empty:
-        lines.append('| # | 代码 | 名称 | 现价 | 当日 | **60日** | 主力净额 | 评分 | 关键 |')
+        lines.append(f'| # | 代码 | 名称 | 现价 | 当日 | **60日** | {ELG_HEAD} | 评分 | 关键 |')
         lines.append('|---|---|---|---|---|---|---|---|---|')
         for i, (_, row) in enumerate(top_picks.iterrows(), 1):
             medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
-            inflow = format_yi(row.get('main_net_inflow', 0))
+            inflow = elg_cell(row)
             score = format_num(row.get('total_score'), '.0f')
             # 关键特征：取题材 + 当日涨幅
             catalyst = ''
@@ -966,11 +1078,11 @@ def generate_review_payload(date_str: str, top_picks: pd.DataFrame,
     lines.append(f'## 📋 今日强势股 TOP {len(top_picks)}（收盘后）')
     lines.append('')
     if not top_picks.empty:
-        lines.append('| # | 代码 | 名称 | 现价 | 当日 | 主力净额 | 评分 | 关键 |')
+        lines.append(f'| # | 代码 | 名称 | 现价 | 当日 | {ELG_HEAD} | 评分 | 关键 |')
         lines.append('|---|---|---|---|---|---|---|---|')
         for i, (_, row) in enumerate(top_picks.iterrows(), 1):
             medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else str(i)
-            inflow = format_yi(row.get('main_net_inflow', 0))
+            inflow = elg_cell(row)
             score = format_num(row.get('total_score'), '.0f')
             catalyst = ''
             for k, v in row.get('score_breakdown', {}).items():
@@ -1039,7 +1151,7 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
     lines.append(f'# 🎯 主升浪精选日报 {date_str}')
     lines.append('')
     lines.append(f'> 数据时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} · 数据源：Tushare')
-    lines.append(f'> 筛选：沪深主板 / 非ST / 趋势向上 / 主力流入')
+    lines.append(screen_footnote().replace('> 🎯 ', '> ').replace('主板非ST', '沪深主板 / 非ST'))
     lines.append('')
 
     # 大盘环境
