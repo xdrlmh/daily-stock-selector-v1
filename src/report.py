@@ -15,6 +15,11 @@ try:
     from src.portfolio import (
         MAX_HOLDINGS as _MAX_HOLDINGS,
         DEFAULT_STOP_LOSS_PCT as _STOP_LOSS_PCT,
+        EXIT_USE_STOP as _EXIT_USE_STOP,
+        EXIT_USE_MA as _EXIT_USE_MA,
+        EXIT_MA_HALF as _EXIT_MA_HALF,
+        EXIT_MA_CLEAR as _EXIT_MA_CLEAR,
+        TRAIL_ENABLED as _TRAIL_ENABLED,
         TRAIL_ACTIVATE_PCT as _TRAIL_ACTIVATE_PCT,
         TRAIL_DRAWDOWN_PCT as _TRAIL_DRAWDOWN_PCT,
         TIME_STOP_ENABLED as _TIME_STOP_ENABLED,
@@ -25,11 +30,17 @@ try:
         MARKET_FUSE_ENABLED as _MARKET_FUSE_ENABLED,
         MARKET_FUSE_INDEX as _MARKET_FUSE_INDEX,
         MARKET_FUSE_DROP_PCT as _MARKET_FUSE_DROP_PCT,
+        MARKET_FUSE_BLOCK_REFILL as _MARKET_FUSE_BLOCK_REFILL,
     )
 except ImportError:  # 兼容以顶层模块方式导入
     from portfolio import (
         MAX_HOLDINGS as _MAX_HOLDINGS,
         DEFAULT_STOP_LOSS_PCT as _STOP_LOSS_PCT,
+        EXIT_USE_STOP as _EXIT_USE_STOP,
+        EXIT_USE_MA as _EXIT_USE_MA,
+        EXIT_MA_HALF as _EXIT_MA_HALF,
+        EXIT_MA_CLEAR as _EXIT_MA_CLEAR,
+        TRAIL_ENABLED as _TRAIL_ENABLED,
         TRAIL_ACTIVATE_PCT as _TRAIL_ACTIVATE_PCT,
         TRAIL_DRAWDOWN_PCT as _TRAIL_DRAWDOWN_PCT,
         TIME_STOP_ENABLED as _TIME_STOP_ENABLED,
@@ -40,6 +51,7 @@ except ImportError:  # 兼容以顶层模块方式导入
         MARKET_FUSE_ENABLED as _MARKET_FUSE_ENABLED,
         MARKET_FUSE_INDEX as _MARKET_FUSE_INDEX,
         MARKET_FUSE_DROP_PCT as _MARKET_FUSE_DROP_PCT,
+        MARKET_FUSE_BLOCK_REFILL as _MARKET_FUSE_BLOCK_REFILL,
     )
 
 
@@ -638,6 +650,11 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                               stats: Dict = None,
                               max_holdings: int = _MAX_HOLDINGS,
                               stop_loss_pct: float = _STOP_LOSS_PCT,
+                              exit_use_stop: bool = _EXIT_USE_STOP,
+                              exit_use_ma: bool = _EXIT_USE_MA,
+                              exit_ma_half: int = _EXIT_MA_HALF,
+                              exit_ma_clear: int = _EXIT_MA_CLEAR,
+                              trail_enabled: bool = _TRAIL_ENABLED,
                               trail_activate_pct: float = _TRAIL_ACTIVATE_PCT,
                               trail_drawdown_pct: float = _TRAIL_DRAWDOWN_PCT,
                               time_stop_enabled: bool = _TIME_STOP_ENABLED,
@@ -647,15 +664,18 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                               inefficient_peak_pct: float = _INEFFICIENT_PEAK_PCT,
                               market_fuse_enabled: bool = _MARKET_FUSE_ENABLED,
                               market_fuse_index: str = _MARKET_FUSE_INDEX,
-                              market_fuse_drop_pct: float = _MARKET_FUSE_DROP_PCT) -> List[str]:
+                              market_fuse_drop_pct: float = _MARKET_FUSE_DROP_PCT,
+                              market_fuse_block_refill: bool = _MARKET_FUSE_BLOCK_REFILL) -> List[str]:
     """
-    生成「模拟盘持仓」markdown 段（移动止盈结算 / 时间止损 / 自动补仓结果）
+    生成「模拟盘持仓」markdown 段（离场结算 / 减半仓 / 自动补仓结果）
 
     - holdings_status：当前活跃持仓的评估结果列表
-    - closed_today：当日触发止损/移动止盈/时间止损并已平仓的持仓
+    - closed_today：当日触发清仓（止损 / 破MA20 / 移动止盈 / 时间止损）的持仓
     - new_positions：当日自动补仓的新增持仓
-    - trail_started：当日新启动移动止盈的持仓
-    - stats：累计战绩（portfolio_stats() 的返回值）
+    - trail_started：当日新启动移动止盈的持仓（仅 TRAIL_ENABLED 时可能有值）
+
+    ★ 离场口径（2026-09-22 起，大波段）：固定止损 −7% ＋ 破 MA10 减半 ＋ 破 MA20 清仓，
+      熔断（上证 ≤ −2%）当天只暂缓「破 MA10 减半」并暂停补仓。
     """
     rows = holdings_status or []
     closed_today = closed_today or []
@@ -665,12 +685,20 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
     lines = [f'## 💼 模拟盘持仓（{len(rows)}/{max_holdings}）', '']
 
     if rows:
-        lines.append('| # | 代码 | 名称 | 持有 | 买入价 | 现价 | 盈亏 | 峰涨 | 距止损 | 距止盈 | 状态 |')
+        dist_col = (f'距MA{exit_ma_half}/MA{exit_ma_clear}' if exit_use_ma else '距止盈')
+        lines.append('| # | 代码 | 名称 | 持有 | 买入价 | 现价 | 盈亏 | 峰涨 | 距止损 | '
+                     + dist_col + ' | 状态 |')
         lines.append('|---|---|---|---|---|---|---|---|---|---|---|')
         for i, r in enumerate(rows, 1):
             trail_active = bool(r.get('trail_active'))
             if r.get('entry_pending'):
                 status = '⏳ 待开盘价'
+            elif r.get('fused'):
+                status = r.get('status_text') or '⚡ 熔断暂缓'
+            elif r.get('trigger') == 'ma10_half':
+                status = r.get('status_text') or f'✂️ 破MA{exit_ma_half} 减半仓'
+            elif r.get('half_sold'):
+                status = f'◐ 半仓持有（已破MA{exit_ma_half}）'
             elif trail_active and r.get('trail_high'):
                 # 已启动移动止盈 → 状态里带上峰值，一眼看出锁利位置
                 status = f"🔒 移动止盈(峰{r['trail_peak_pnl']:+.0f}%)"
@@ -687,9 +715,15 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
             # 期间最高涨幅
             peak_pnl = r.get('peak_high_pnl')
             peak_txt = f'{peak_pnl:+.1f}%' if peak_pnl is not None else '-'
-            # 距止盈：未启动＝距启动线；已启动＝距回撤触发线
-            dist_tp = r.get('distance_to_take_profit')
-            dist_txt = f'{dist_tp:+.1f}%' if dist_tp is not None else '-'
+            # 距离场闸门：MA 模式＝距 MA10 / MA20；旧模式＝距止盈线
+            if exit_use_ma:
+                g10, g20 = r.get('ma10_gap_pct'), r.get('ma20_gap_pct')
+                d10 = f'{g10:+.1f}%' if g10 is not None else '-'
+                d20 = f'{g20:+.1f}%' if g20 is not None else '-'
+                dist_txt = f'{d10} / {d20}'
+            else:
+                dist_tp = r.get('distance_to_take_profit')
+                dist_txt = f'{dist_tp:+.1f}%' if dist_tp is not None else '-'
             lines.append(
                 f"| {i} | {r['code']} | {r['name']} | {days_txt} | "
                 f"{r['buy_price']:.2f} | {r['current_price']:.2f} | "
@@ -697,14 +731,52 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                 f"{r['distance_to_stop_loss']:+.1f}% | {dist_txt} | {status} |"
             )
         lines.append('')
-        lines.append(f'> 💡 买入价＝信号次日开盘价（模拟盘口径）｜止损 {stop_loss_pct}% ／ '
-                     f'盈利 +{trail_activate_pct}% 启动**移动止盈**（峰值回撤 {trail_drawdown_pct}% 卖出）')
+        lines.append(f'> 💡 买入价＝信号次日开盘价（模拟盘口径）')
+        rules = []
+        if exit_use_stop:
+            rules.append(f'收盘 ≤{stop_loss_pct}% **固定止损**')
+        if exit_use_ma:
+            rules.append(f'跌破 MA{exit_ma_half} **卖出 50%**（减半后不补仓）')
+            rules.append(f'跌破 MA{exit_ma_clear} **全部清仓**')
+        if trail_enabled:
+            rules.append(f'盈利 +{trail_activate_pct}% 启动移动止盈（回撤 {trail_drawdown_pct}% 卖出）')
+        if rules:
+            lines.append('> 📐 离场规则：' + ' ｜ '.join(rules))
         if time_stop_enabled:
             lines.append(f'> 🧹 时间止损：持有 ≥{zombie_days}日且期间最高涨幅 <{zombie_peak_pct}% → 🧟 僵尸股清理；'
                          f'≥{inefficient_days}日且期间最高 <{inefficient_peak_pct}% → 🐌 低效股清理')
         if market_fuse_enabled:
             lines.append(f'> ⚡ 大盘熔断：{market_fuse_index} 单日跌幅 ≤{market_fuse_drop_pct}% → '
-                         f'当天暂停时间止损（止损 / 移动止盈不受影响）')
+                         f'当天**只暂缓「破MA{exit_ma_half}减半」**'
+                         + ('＋暂停补仓' if market_fuse_block_refill else '')
+                         + f'；固定止损与破MA{exit_ma_clear}清仓**照常执行**')
+        lines.append('')
+
+    # 今日减半仓（破 MA10 → 卖出 50%，仍持有剩余仓位）
+    half_today = [r for r in rows if r.get('trigger') == 'ma10_half' and not r.get('fused')]
+    if half_today:
+        lines.append(f'### ✂️ 今日破 MA{exit_ma_half} 减半仓')
+        lines.append('')
+        for r in half_today:
+            pnl = r.get('half_pnl_pct')
+            pnl_txt = f'{pnl:+.2f}%' if pnl is not None else '-'
+            lines.append(
+                f"- ✂️ **{r.get('name')}({r.get('code')})** 卖出 50% **{pnl_txt}**"
+                f"（现价 {r.get('half_price')} < MA{exit_ma_half} {r.get('ma10')}）"
+                f"→ 剩余 {int((r.get('remaining_ratio') or 0.5) * 100)}% 继续持有，**不补仓**"
+            )
+        lines.append('')
+
+    # 熔断暂缓（破MA10减半 / 时间止损）
+    fused_rows = [r for r in rows if r.get('fused')]
+    if fused_rows:
+        lines.append('### ⚡ 大盘熔断·今日暂缓')
+        lines.append('')
+        for r in fused_rows:
+            lines.append(f"- ⚡ **{r.get('name')}({r.get('code')})** {r.get('status_text')}"
+                         f"（现价 {r.get('current_price')} ｜ MA{exit_ma_half} {r.get('ma10')}）"
+                         f"→ 今日不动作，大盘企稳后自动补执行")
+        lines.append('> ⚠️ 熔断**不影响**固定止损与破 MA 清仓 —— 那是保护性纪律。')
         lines.append('')
 
     # 今日新启动移动止盈
@@ -720,15 +792,15 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
         lines.append(f'> 说明：触发线随峰值上移（只上不下），跌破回撤线即卖出。')
         lines.append('')
 
-    # 按平仓原因拆分：普通出场（移动止盈/止损） vs 时间止损（清理让位）
+    # 按清仓原因拆分：普通出场（止损/破MA20/移动止盈） vs 时间止损（清理让位）
     exits = [h for h in closed_today
-             if h.get('close_reason') in ('take_profit', 'stop_loss')]
+             if h.get('close_reason') in ('take_profit', 'stop_loss', 'ma20_exit')]
     time_stops = [h for h in closed_today
                   if str(h.get('close_reason') or '').startswith('time_stop')]
 
-    # 今日触发（移动止盈 / 止损）
+    # 今日触发（固定止损 / 破 MA20 清仓 / 移动止盈）
     if exits:
-        lines.append('### 🚨 今日触发')
+        lines.append('### 🚨 今日清仓')
         lines.append('')
         for h in exits:
             reason = h.get('close_reason')
@@ -737,14 +809,21 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
                 icon, label = '🔒', '移动止盈卖出'
                 if peak is not None:
                     label += f'（峰值 {peak:+.1f}%）'
+            elif reason == 'ma20_exit':
+                icon, label = '🔻', f'跌破 MA{exit_ma_clear} 清仓'
             else:
-                icon, label = '🚨', '触发止损'
+                icon, label = '🚨', '触发固定止损'
             pnl = h.get('closed_pnl')
             pnl_txt = f'{pnl:+.2f}%' if pnl is not None else '-'
             price_txt = ''
             if h.get('closed_price'):
                 price_txt = f'（{h.get("buy_price"):.2f} → {h["closed_price"]:.2f}）'
-            lines.append(f'- {icon} **{h.get("name")}({h.get("code")})** {label} **{pnl_txt}**{price_txt} → 已平仓')
+            half_txt = ''
+            if h.get('half_sold'):
+                half_txt = (f' ◐加权口径：半仓段 **{h.get("half_sold_pnl"):+.2f}%**'
+                            f'×{h.get("half_ratio")} + 尾段 **{h.get("closed_pnl_leg2"):+.2f}%**')
+            lines.append(f'- {icon} **{h.get("name")}({h.get("code")})** {label} '
+                         f'**{pnl_txt}**{price_txt} → 已清仓{half_txt}')
         lines.append('')
 
     # 今日时间止损（僵尸股 / 低效股清理 → 腾出仓位给新机会）
@@ -774,26 +853,6 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
         lines.append('> 🧹 清理腾出的仓位，已由下方「今日补仓」用当日强势股补齐。')
         lines.append('')
 
-    # ⚡ 大盘弱势熔断：已满足时间止损条件、但当天暂缓执行的持仓
-    fused_rows = [r for r in rows if r.get('fused')]
-    if fused_rows:
-        lines.append('### ⚡ 大盘弱势熔断（暂缓时间止损）')
-        lines.append('')
-        for r in fused_rows:
-            peak = r.get('peak_high_pnl')
-            peak_txt = f'{peak:+.1f}%' if peak is not None else '-'
-            days = r.get('days_held')
-            days_txt = f'{int(days)} 交易日' if days is not None else '-'
-            lines.append(
-                f"- ⚡ **{r.get('name')}({r.get('code')})** 已满足时间止损条件"
-                f"（持有 {days_txt} / 期间最高 {peak_txt}），因大盘弱势**暂缓清理**，持仓保留"
-            )
-        lines.append('')
-        lines.append(f'> 说明：{market_fuse_index} 单日跌幅 ≤ {market_fuse_drop_pct}% 时不做主动换仓'
-                     f'（避免暴跌日卖在最低点），大盘企稳后自动补执行；'
-                     f'同日的止损 / 移动止盈不受影响。')
-        lines.append('')
-
     # 今日补仓
     if new_positions:
         lines.append('### 🛒 今日补仓（自动补位）')
@@ -814,16 +873,22 @@ def generate_holdings_section(holdings_status: List[Dict] = None,
             f"｜ 平均收益 **{stats['avg_pnl']:+.2f}%**"
         )
         parts = []
+        if stats.get('stop_losses'):
+            parts.append(f"🚨 固定止损 {stats['stop_losses']}")
+        if stats.get('ma20_exits'):
+            parts.append(f"🔻 破MA{exit_ma_clear}清仓 {stats['ma20_exits']}")
+        if stats.get('half_exits'):
+            parts.append(f"✂️ 含减半 {stats['half_exits']}")
         if stats.get('take_profits'):
             parts.append(f"🔒 移动止盈 {stats['take_profits']}")
-        if stats.get('stop_losses'):
-            parts.append(f"🚨 止损 {stats['stop_losses']}")
         if stats.get('time_stops'):
             parts.append(f"🧹 时间止损 {stats['time_stops']}")
         if stats.get('avg_days_held') is not None:
             parts.append(f"平均持有 {stats['avg_days_held']} 交易日")
         if parts:
             lines.append(f"- {' ｜ '.join(parts)}")
+        lines.append('> 📐 统计口径：一笔「先减半、后清仓」的交易**合并为 1 笔**，'
+                     '收益按 50%×半仓段 + 50%×尾段加权。')
         lines.append('')
 
     if not rows and not closed_today and not new_positions:
