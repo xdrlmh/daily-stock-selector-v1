@@ -29,7 +29,7 @@ from src.config import TEST_ONLY, REPORTS_DIR, validate_config
 from src.data_fetcher import (
     fetch_market_spot, fetch_fund_flow_rank,
     filter_main_board, enrich_with_fund_flow,
-    fetch_market_overview,
+    fetch_market_overview, merge_ma_panel,
 )
 from src.selector import screen_stocks, fallback_from_top_gainers
 from src.report import generate_dingtalk_payload, save_full_report
@@ -77,6 +77,9 @@ def main():
     # 4. 合并资金流数据
     enriched = enrich_with_fund_flow(main_board, fund_df)
     log.info(f'合并资金流后：{len(enriched)} 只')
+
+    # 4.5 合并均线面板（趋势线 MA120）—— 取不到数据时原样返回，技术面自动退回原口径
+    enriched = merge_ma_panel(enriched)
 
     # 5. 评分 + 筛选
     top_picks, warnings, all_scored = screen_stocks(enriched)
