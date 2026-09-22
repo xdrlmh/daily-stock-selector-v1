@@ -10,9 +10,17 @@ import os
 import time
 import tushare as ts
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import warnings
+
+try:
+    from .config import (CAPITAL_MODE, CAPITAL_SHORT_DAYS, CAPITAL_LONG_DAYS,
+                         CAPITAL_MIN_VALID_DAYS)
+except ImportError:      # 直接运行本文件时（python src/data_fetcher.py）
+    from config import (CAPITAL_MODE, CAPITAL_SHORT_DAYS, CAPITAL_LONG_DAYS,
+                        CAPITAL_MIN_VALID_DAYS)
 
 warnings.filterwarnings('ignore')
 
@@ -397,6 +405,9 @@ MA_TREND_ENABLED = os.environ.get('MA120_TREND', 'on').strip().lower() not in ('
 MA_EXIT_ENABLED = os.environ.get('MA_EXIT', 'on').strip().lower() not in ('0', 'off', 'false', 'no')
 MA_TREND_DAYS = 130          # MA120 需 ≥120 根；留 10 根缓冲（停牌/新股）
 _MA_PANEL_CACHE: pd.DataFrame = pd.DataFrame()
+# 同一次取数顺带缓存的**成交额矩阵**（index=trade_date, columns=ts_code，单位千元）。
+# 供资金面占比分母复用 → 零额外 API 调用（见 fetch_moneyflow_panel）。
+_AMT_MATRIX_CACHE: pd.DataFrame = pd.DataFrame()
 
 
 def fetch_ma_panel(need: int = MA_TREND_DAYS) -> pd.DataFrame:
@@ -409,7 +420,7 @@ def fetch_ma_panel(need: int = MA_TREND_DAYS) -> pd.DataFrame:
         次新股同样需要；趋势线打分侧的覆盖率统计仍按 ma120 非空计。
     失败 / 两个开关都关 → 返回空 DataFrame（调用方自动降级，不阻塞主流程）。
     """
-    global _MA_PANEL_CACHE
+    global _MA_PANEL_CACHE, _AMT_MATRIX_CACHE
     if not (MA_TREND_ENABLED or MA_EXIT_ENABLED):
         print('  ⏭️ 均线面板已关闭（MA120_TREND=off 且 MA_EXIT=off）→ 趋势线打分与均线离场均退回原口径')
         return pd.DataFrame()
@@ -441,9 +452,11 @@ def fetch_ma_panel(need: int = MA_TREND_DAYS) -> pd.DataFrame:
     frames = []
     got = 0
     for i, d in enumerate(window):
-        one = _ts_call(pro.daily, trade_date=d, fields='ts_code,close')
+        # ★ 同时取 amount（成交额，千元）→ 供资金面占比分母复用，**零额外调用**
+        one = _ts_call(pro.daily, trade_date=d, fields='ts_code,close,amount')
         if one is not None and not one.empty:
-            one = one[['ts_code', 'close']].copy()
+            cols = [c for c in ('ts_code', 'close', 'amount') if c in one.columns]
+            one = one[cols].copy()
             one['trade_date'] = d
             frames.append(one)
             got += 1
@@ -458,11 +471,19 @@ def fetch_ma_panel(need: int = MA_TREND_DAYS) -> pd.DataFrame:
               '样本仍 ≥120 根故可继续）' % (len(window) - got, len(window)))
 
     # 3) 透视成「日期 × 代码」收盘价矩阵 → 直接算均线
-    pv = pd.concat(frames, ignore_index=True).pivot_table(
+    _all = pd.concat(frames, ignore_index=True)
+    pv = _all.pivot_table(
         index='trade_date', columns='ts_code', values='close', aggfunc='last')
     if pv.empty:
         print('  ⚠️ 均线面板取数失败：透视后为空')
         return pd.DataFrame()
+
+    # 3.5) 顺带缓存成交额矩阵（千元），供资金面占比复用
+    global _AMT_MATRIX_CACHE
+    global _AMT_MATRIX_CACHE
+    if 'amount' in _all.columns:
+        _AMT_MATRIX_CACHE = _all.pivot_table(
+            index='trade_date', columns='ts_code', values='amount', aggfunc='last')
 
     valid = pv.notna().sum()
     ma5 = pv.tail(5).mean().where(valid >= 5)
@@ -769,6 +790,226 @@ def fetch_market_review() -> Dict[str, Any]:
         import traceback
         traceback.print_exc()
     return result
+
+
+# ============ 资金面面板（超大单 5日 / 60日 趋势）============
+# 口径（与 c41_optimization/_analyze_money_v2.py 的实证逐字一致）：
+#   elg_net    = buy_elg_amount − sell_elg_amount            （万元）
+#   e5 / e60   = 近 5 日 / 近 60 日 elg_net **日均**          （万元）
+#   趋势确认   = e5 > e60 且 e5 > 0
+#   占比       = Σ5日 elg_net(万元) × 10 / Σ5日 amount(千元) × 100   （%）
+#   ⚠️ 单位陷阱：moneyflow.*_amount = 万元；daily.amount = 千元 ⇒ 万元 ×10 才是千元
+#   数据完整性 = 近 5 日 elg 与 amount 有效天数均 ≥ CAPITAL_MIN_VALID_DAYS，
+#                否则视为「无信号」（防停牌/次新把占比算虚高，实测 600825 仅 2 天数据算出 76%）
+MF_PANEL_DAYS = 75           # 交易日窗口（需 ≥60；留缓冲，与均线面板同一右端点）
+_MF_PANEL_CACHE: pd.DataFrame = pd.DataFrame()
+
+
+def fetch_moneyflow_panel() -> pd.DataFrame:
+    """批量构造资金面面板（模块级缓存，一次运行只算一次）。
+
+    返回 DataFrame[code, elg_5d_avg, elg_60d_avg, elg_5d_sum, amt_5d_sum,
+                    elg_ratio_5d, elg_days_5d, main_net_inflow]：
+      - `elg_5d_avg` / `elg_60d_avg`：近 5 / 60 日**日均**超大单净额（万元）
+      - `elg_ratio_5d`：近 5 日超大单净额 / 近 5 日成交额（%）
+      - `elg_days_5d`：近 5 日有效数据天数（< CAPITAL_MIN_VALID_DAYS ⇒ 无信号）
+      - `main_net_inflow`：当日**主力净额**（大单+特大单，**元**）—— 仅报告展示用，
+        不参与新口径打分（保留是为了让 report 的既有展示位可平滑过渡）
+    取数失败 / 数据集关闭 → 返回空 DataFrame（调用方**自动跳过硬过滤**，不阻塞主流程）。
+    """
+    global _MF_PANEL_CACHE
+    if CAPITAL_MODE != 'elg':
+        print(f'  ⏭️ 资金面为旧口径（CAPITAL_MODE={CAPITAL_MODE}）→ 不取超大单面板')
+        return pd.DataFrame()
+    if not _MF_PANEL_CACHE.empty:
+        return _MF_PANEL_CACHE
+    try:
+        pro = _init_tushare()
+    except Exception as e:
+        print(f'  ⚠️ 资金面面板取数跳过（Tushare 未就绪）: {e}')
+        return pd.DataFrame()
+
+    # 1) 交易日窗口：右端对齐「已发布的最近交易日」（与全套取数同一口径）
+    dates_desc = _trading_days_desc(pro, count=MF_PANEL_DAYS + 20)
+    if not dates_desc:
+        print('  ⚠️ 资金面面板取数失败：未取到交易日历')
+        return pd.DataFrame()
+    if _RESOLVED_TRADE_DATE and _RESOLVED_TRADE_DATE in dates_desc:
+        right = dates_desc.index(_RESOLVED_TRADE_DATE)
+    else:
+        right = _find_anchor(pro, dates_desc)
+    window = dates_desc[right:right + MF_PANEL_DAYS]     # 倒序，[0] 为最近交易日
+    if len(window) < CAPITAL_LONG_DAYS:
+        print(f'  ⚠️ 资金面面板取数失败：有效交易日仅 {len(window)} 天'
+              f'（需 ≥{CAPITAL_LONG_DAYS}）')
+        return pd.DataFrame()
+
+    # 2) 逐日拉全市场资金流（批量，非逐股）
+    print(f'  📡 资金面面板取数：{len(window)} 个交易日 × 全市场资金流（批量）...')
+    t0 = time.time()
+    frames = []
+    got = 0
+    for i, d in enumerate(window):
+        one = _ts_call(pro.moneyflow, trade_date=d,
+                       fields='ts_code,buy_elg_amount,sell_elg_amount,'
+                              'buy_lg_amount,sell_lg_amount,net_mf_amount')
+        if one is not None and not one.empty:
+            one = one.copy()
+            one['trade_date'] = d
+            frames.append(one)
+            got += 1
+        if (i + 1) % 30 == 0:
+            print('     ...资金面面板 %d/%d 日（已获取 %d 日）' % (i + 1, len(window), got))
+    if got < CAPITAL_LONG_DAYS or not frames:
+        print(f'  ⚠️ 资金面面板取数失败：仅 {got}/{len(window)} 个交易日有数据')
+        return pd.DataFrame()
+
+    mf = pd.concat(frames, ignore_index=True)
+    need = ('buy_elg_amount', 'sell_elg_amount')
+    if any(c not in mf.columns for c in need):
+        print(f'  ⚠️ 资金面面板取数失败：moneyflow 缺字段 {need}（实际 {list(mf.columns)[:8]}…）')
+        return pd.DataFrame()
+    mf['elg_net'] = (pd.to_numeric(mf['buy_elg_amount'], errors='coerce')
+                     - pd.to_numeric(mf['sell_elg_amount'], errors='coerce'))
+    if 'buy_lg_amount' in mf.columns and 'sell_lg_amount' in mf.columns:
+        mf['big_net'] = mf['elg_net'] + (pd.to_numeric(mf['buy_lg_amount'], errors='coerce')
+                                         - pd.to_numeric(mf['sell_lg_amount'], errors='coerce'))
+    if 'net_mf_amount' in mf.columns:
+        mf['main_net'] = pd.to_numeric(mf['net_mf_amount'], errors='coerce')
+
+    # 3) 透视成「日期 × 代码」矩阵（★ 索引与成交额矩阵各自独立，杜绝前视/错位）
+    elg_mat = mf.pivot_table(index='trade_date', columns='ts_code',
+                             values='elg_net', aggfunc='last').sort_index(axis=0)
+    # 成交额矩阵：优先复用均线面板顺带取的（零额外调用）；缺失时自己补近 5 日
+    amt_mat = _AMT_MATRIX_CACHE
+    if amt_mat is None or amt_mat.empty:
+        print('  ℹ️ 成交额矩阵未随均线面板缓存 → 单独取近 %d 日成交额' % CAPITAL_SHORT_DAYS)
+        amt_mat = _fetch_amount_matrix(pro, window[:CAPITAL_SHORT_DAYS])
+
+    ECOL = list(elg_mat.index)
+    if len(ECOL) < CAPITAL_LONG_DAYS:
+        print(f'  ⚠️ 资金面面板取数失败：资金流有效交易日仅 {len(ECOL)} 天')
+        return pd.DataFrame()
+
+    d5 = ECOL[-CAPITAL_SHORT_DAYS:]
+    d60 = ECOL[-CAPITAL_LONG_DAYS:]
+    assert max(d5) <= window[0] and max(d60) <= window[0], '★ 资金面前视检查失败'
+
+    # 4) 逐股聚合（★ 全部按各自矩阵的日期集合切，不用跨表索引位置；
+    #    ★★ 所有结果统一 reindex 到 elg_mat.columns —— 资金流与日线两份矩阵的
+    #    代码集合并不相同（有日线无资金流 / 反之），不 reindex 会「数组长度不一致」）
+    cols = list(elg_mat.columns)
+    sub5, sub60 = elg_mat.loc[d5], elg_mat.loc[d60]
+    e5 = sub5.mean(axis=0).reindex(cols)
+    e60 = sub60.mean(axis=0).reindex(cols)
+    s5 = sub5.sum(axis=0, min_count=1).reindex(cols)
+    days5 = sub5.notna().sum(axis=0).reindex(cols)
+
+    if amt_mat is not None and not amt_mat.empty:
+        amt5 = amt_mat.reindex(index=d5).reindex(columns=cols)   # 千元
+        a5 = amt5.sum(axis=0, min_count=1)
+        amt_days5 = amt5.notna().sum(axis=0)
+    else:
+        a5 = pd.Series(np.nan, index=cols)
+        amt_days5 = pd.Series(0, index=cols)
+    # 占比：万元 ×10 → 千元；分母为 0 / 缺数据 → NaN
+    ratio = (s5 * 10 / a5.replace(0, np.nan)) * 100
+    # 完整性 = 资金流天数与成交额天数的较小者
+    valid_days = np.minimum(
+        pd.Series(days5.values, index=cols).fillna(0).astype(float).values,
+        pd.Series(amt_days5.values, index=cols).fillna(0).astype(float).values)
+
+    last = ECOL[-1]
+    out = pd.DataFrame({
+        'code': [str(c).split('.')[0].zfill(6) for c in cols],
+        'elg_5d_avg': e5.values,
+        'elg_60d_avg': e60.values,
+        'elg_5d_sum': s5.values,
+        'amt_5d_sum': a5.values,
+        'elg_ratio_5d': ratio.values,
+        'elg_days_5d': valid_days,
+    })
+    # 当日主力净额（元）—— 仅供报告展示；沿用旧列名以免 report 代码大面积改动
+    if 'main_net' in mf.columns:
+        m_last = mf[mf['trade_date'] == last].dropna(subset=['main_net'])
+        m_map = {str(r['ts_code']).split('.')[0].zfill(6): r['main_net'] * 1e4
+                 for _, r in m_last.iterrows()}
+        out['main_net_inflow'] = out['code'].map(m_map)
+    else:
+        out['main_net_inflow'] = np.nan
+    # ⚠️ 保持与旧口径一致：`main_net_inflow_pct` 恒为 0.0
+    #    （`is_capital_outflow` 因此仍不生效 —— 本轮**不擅自修复**，作为观察项报告）
+    out['main_net_inflow_pct'] = 0.0
+
+    out = out[out['elg_5d_avg'].notna() | out['elg_60d_avg'].notna()].reset_index(drop=True)
+    if out.empty:
+        print('  ⚠️ 资金面面板取数失败：无任何股票算出超大单净额')
+        return pd.DataFrame()
+
+    _MF_PANEL_CACHE = out
+    ok = int((out['elg_days_5d'] >= CAPITAL_MIN_VALID_DAYS).sum())
+    trend = out[(out['elg_5d_avg'] > out['elg_60d_avg']) & (out['elg_5d_avg'] > 0)]
+    print('  ✅ 资金面面板取数完成：%d 只（数据完整 %d 只 ｜ 趋势确认 %d 只 = %.0f%%），'
+          '用时 %.0f 秒（%d 个交易日）'
+          % (len(out), ok, len(trend), len(trend) / len(out) * 100, time.time() - t0, got))
+    return out
+
+
+def _fetch_amount_matrix(pro: Any, dates: List[str]) -> pd.DataFrame:
+    """单独取「日期 × 代码」成交额矩阵（千元）—— 仅当均线面板未缓存时兜底。"""
+    frames = []
+    for d in dates:
+        one = _ts_call(pro.daily, trade_date=d, fields='ts_code,amount')
+        if one is not None and not one.empty and 'amount' in one.columns:
+            one = one[['ts_code', 'amount']].copy()
+            one['trade_date'] = d
+            frames.append(one)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).pivot_table(
+        index='trade_date', columns='ts_code', values='amount', aggfunc='last')
+
+
+def merge_moneyflow_panel(df: pd.DataFrame) -> pd.DataFrame:
+    """把资金面面板并进候选表（新增 elg_5d_avg / elg_60d_avg / elg_ratio_5d 等列）。
+
+    - `CAPITAL_MODE=legacy` → **不并表**（资金面严格退回旧口径）
+    - 取不到数据时**原样返回**（不新增列）→ selector 的 `is_capital_trend_ok`
+      与 `calc_capital_score` 走「降级」分支：**不硬过滤**、资金面给中性分。
+    """
+    if df is None or df.empty:
+        return df
+    if CAPITAL_MODE != 'elg':
+        print(f'  ⏭️ 资金面为新口径已关闭（CAPITAL_MODE={CAPITAL_MODE}）→ 沿用旧口径')
+        return df
+    panel = fetch_moneyflow_panel()
+    if panel is None or panel.empty:
+        return df
+    df = df.copy()
+    df['code_str'] = df['code'].astype(str).str.zfill(6)
+    cols = ['code', 'elg_5d_avg', 'elg_60d_avg', 'elg_5d_sum', 'amt_5d_sum',
+            'elg_ratio_5d', 'elg_days_5d', 'main_net_inflow', 'main_net_inflow_pct']
+    cols = [c for c in cols if c in panel.columns]
+    # ⚠️ 后缀必须是 ('', '_mf')：左侧的 `code` 是主键要保留；
+    #    若写成 ('_old', '')，left join 未命中的股票会把 `code` 挤成 NaN（`code_old` 才是真值）。
+    df = df.merge(panel[cols], left_on='code_str', right_on='code',
+                  how='left', suffixes=('', '_mf'))
+    hit = int(df['elg_5d_avg'].notna().sum()) if 'elg_5d_avg' in df.columns else 0
+    print(f'  ✅ 资金面面板已并入：{hit}/{len(df)} 只含超大单面板数据')
+    return df
+
+
+def merge_capital(df: pd.DataFrame) -> pd.DataFrame:
+    """资金面并表**统一入口**：按 `CAPITAL_MODE` 分派。
+
+    - `elg`（默认）：`merge_moneyflow_panel` → 超大单 5日/60日 面板
+    - `legacy`     ：`fetch_fund_flow_rank` + `enrich_with_fund_flow` → 当日主力净流入
+    """
+    if CAPITAL_MODE == 'elg':
+        return merge_moneyflow_panel(df)
+    print('  ⏭️ CAPITAL_MODE=legacy → 沿用旧的当日主力净流入口径')
+    fund_df = fetch_fund_flow_rank()
+    return enrich_with_fund_flow(df, fund_df)
 
 
 if __name__ == '__main__':
