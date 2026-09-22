@@ -25,14 +25,14 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import TEST_ONLY, REPORTS_DIR, validate_config
+from src.config import TEST_ONLY, REPORTS_DIR, validate_config, CAPITAL_MODE
 from src.data_fetcher import (
     fetch_market_spot, fetch_fund_flow_rank,
     filter_main_board, enrich_with_fund_flow,
-    fetch_market_overview, merge_ma_panel,
+    fetch_market_overview, merge_ma_panel, merge_capital,
 )
 from src.selector import screen_stocks, fallback_from_top_gainers
-from src.report import generate_dingtalk_payload, save_full_report
+from src.report import generate_dingtalk_payload, save_full_report, elg_cell
 from src.notifier import push_all, summarize
 from src.portfolio import fill_portfolio_from_candidates, get_active_holdings, MAX_HOLDINGS
 
@@ -68,18 +68,17 @@ def main():
         log.error('行情数据抓取失败，退出')
         sys.exit(1)
 
-    fund_df = fetch_fund_flow_rank()
-
     # 3. 过滤主板非ST
     main_board = filter_main_board(spot_df)
     log.info(f'主板非ST候选：{len(main_board)} 只')
 
-    # 4. 合并资金流数据
-    enriched = enrich_with_fund_flow(main_board, fund_df)
-    log.info(f'合并资金流后：{len(enriched)} 只')
+    # 4. 合并均线面板（趋势线 MA120 + 离场均线）—— 顺带缓存成交额矩阵，
+    #    供资金面占比分母复用（**零额外取数**）；取不到数据时原样返回，自动退回原口径
+    enriched = merge_ma_panel(main_board)
 
-    # 4.5 合并均线面板（趋势线 MA120）—— 取不到数据时原样返回，技术面自动退回原口径
-    enriched = merge_ma_panel(enriched)
+    # 5. 合并资金面（新口径：超大单 5日/60日 趋势面板；legacy：当日主力净流入）
+    enriched = merge_capital(enriched)
+    log.info(f'合并均线 + 资金面后：{len(enriched)} 只')
 
     # 5. 评分 + 筛选
     top_picks, warnings, all_scored = screen_stocks(enriched)
@@ -144,12 +143,14 @@ def main():
     print(f'📊 TOP {len(top_picks)} 精选')
     print('=' * 60)
     if not top_picks.empty:
-        print(f"{'#':<3} {'代码':<10} {'名称':<12} {'现价':<8} {'当日':<8} {'主力':<10} {'评分':<6}")
+        # 第 6 列口径随 CAPITAL_MODE 变化（新口径 = 超大单占比；legacy = 当日主力净额）
+        print(f"{'#':<3} {'代码':<10} {'名称':<12} {'现价':<8} {'当日':<8} "
+              f"{('超大单占比' if CAPITAL_MODE == 'elg' else '主力'):<10} {'评分':<6}")
         for i, (_, row) in enumerate(top_picks.iterrows(), 1):
             print(
                 f"{i:<3} {row['code']:<10} {row['name']:<12} "
                 f"{row['price']:<8.2f} {row['pct_change']:+.2f}%   "
-                f"{row.get('main_net_inflow', 0)/1e8:+.1f}亿   "
+                f"{elg_cell(row):<10} "
                 f"{row['total_score']:<6.0f}"
             )
 
