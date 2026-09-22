@@ -17,72 +17,137 @@ from .data_fetcher import fetch_history_kline
 # ============================================================
 # 一、技术面评分（25 分）
 # ============================================================
+# 分值结构（2026-09-22 起）：趋势线 10 分 + 其余四项等比压缩 8/8/5/4 → 5/5/3/2（合计 15）
+MA_TREND_FULL = 10      # 趋势线满分：MA5 > MA120 且 现价 ≥ MA120
+MA_TREND_PASS = 6       # 趋势线及格：MA5 > MA20（未达满分）
+MA_TREND_SCALE = 0.6    # 启用趋势线时，其余四项的分值缩放系数
+
+
+def _pt(base: float, k: float) -> int:
+    """按缩放系数折算分值（k=1.0 时即原分值 → 保证与改版前逐位一致）"""
+    return int(round(base * k))
+
+
+def _ma_trend_tier(row: pd.Series) -> Optional[str]:
+    """趋势线档位（锚定 MA120）。
+
+    'full' 满分：MA5 > MA120 且 现价 ≥ MA120
+    'pass' 及格：MA5 > MA20（未达满分）
+    'none' 0 分：两者都不满足
+    None   数据缺失（无 ma 列 / NaN / MA120≤0，如次新股不足 120 根）
+           → 本项不计分，其余四项按原口径给分（与改版前一致）
+    """
+    vals = []
+    for key in ('ma5', 'ma20', 'ma120', 'price'):
+        v = row.get(key, None)
+        if v is None:
+            return None
+        try:
+            if pd.isna(v):
+                return None
+            vals.append(float(v))
+        except (TypeError, ValueError):
+            return None
+    ma5, ma20, ma120, px = vals
+    if ma120 <= 0:
+        return None
+    if ma5 > ma120 and px >= ma120:
+        return 'full'
+    if ma5 > ma20:
+        return 'pass'
+    return 'none'
+
+
 def calc_tech_score(row: pd.Series) -> Tuple[float, Dict]:
     """
-    基于实时行情粗略打分（不依赖 K 线）
-    - 当日涨幅（温和上涨 0~5% 加分，过热扣分）
+    技术面评分（满分 25）
+
+    - 当日涨幅（温和上涨加分，过热/深跌扣分）
     - 5日累计涨幅（趋势强度）
     - 60日涨幅（中长期趋势）
     - 量比（量能配合）
+    - 【2026-09-22 新增】趋势线（锚定 MA120）
+        满分 10：MA5 > MA120 且 现价 ≥ MA120
+        及格  6：MA5 > MA20（未达满分）
+        0     ：两者都不满足
+        数据缺失：本项不计分，其余四项回到原 8/8/5/4 口径
+
+    ⚠️ 前四项的**判据与阈值一行未改**，只把分值上限按 MA_TREND_SCALE 等比压缩；
+       趋势线未启用（数据缺失 / MA120_TREND=off）时，输出与改版前逐位一致。
     """
     score = 0
     detail = {}
 
-    # 1) 当日涨幅（0~8 分）
+    tier = _ma_trend_tier(row)
+    k = MA_TREND_SCALE if tier is not None else 1.0
+
+    # 1) 当日涨幅（原 0~8 分）
     pct = row.get('pct_change', 0)
     if pd.isna(pct):
         pct = 0
     if 0 <= pct <= 3:
-        score += 8; detail['当日涨幅'] = f'{pct:.1f}% (8分)'
+        score += _pt(8, k); detail['当日涨幅'] = f'{pct:.1f}% ({_pt(8, k)}分)'
     elif 3 < pct <= 6:
-        score += 6; detail['当日涨幅'] = f'{pct:.1f}% (6分)'
+        score += _pt(6, k); detail['当日涨幅'] = f'{pct:.1f}% ({_pt(6, k)}分)'
     elif 6 < pct <= 9.5:
-        score += 4; detail['当日涨幅'] = f'{pct:.1f}% (4分)'
+        score += _pt(4, k); detail['当日涨幅'] = f'{pct:.1f}% ({_pt(4, k)}分)'
     elif pct > 9.5:  # 涨停
-        score += 2; detail['当日涨幅'] = f'{pct:.1f}% 涨停 (2分)'
+        score += _pt(2, k); detail['当日涨幅'] = f'{pct:.1f}% 涨停 ({_pt(2, k)}分)'
     elif -2 <= pct < 0:
-        score += 4; detail['当日涨幅'] = f'{pct:.1f}% 微调 (4分)'
+        score += _pt(4, k); detail['当日涨幅'] = f'{pct:.1f}% 微调 ({_pt(4, k)}分)'
     else:
-        score += 1; detail['当日涨幅'] = f'{pct:.1f}% 下跌 (1分)'
+        score += _pt(1, k); detail['当日涨幅'] = f'{pct:.1f}% 下跌 ({_pt(1, k)}分)'
 
-    # 2) 5日累计涨幅（0~8 分）
+    # 2) 5日累计涨幅（原 0~8 分）
     pct_5d = row.get('pct_5d', row.get('pct_change', 0))  # 没 5日数据时用当日
     if pd.isna(pct_5d):
         pct_5d = 0
     if 3 <= pct_5d <= 15:
-        score += 8; detail['5日涨幅'] = f'{pct_5d:.1f}% (8分)'
+        score += _pt(8, k); detail['5日涨幅'] = f'{pct_5d:.1f}% ({_pt(8, k)}分)'
     elif 15 < pct_5d <= 30:
-        score += 5; detail['5日涨幅'] = f'{pct_5d:.1f}% (5分)'
+        score += _pt(5, k); detail['5日涨幅'] = f'{pct_5d:.1f}% ({_pt(5, k)}分)'
     elif pct_5d > 30:
-        score += 2; detail['5日涨幅'] = f'{pct_5d:.1f}% 过热 (2分)'
+        score += _pt(2, k); detail['5日涨幅'] = f'{pct_5d:.1f}% 过热 ({_pt(2, k)}分)'
     else:
-        score += 3; detail['5日涨幅'] = f'{pct_5d:.1f}% (3分)'
+        score += _pt(3, k); detail['5日涨幅'] = f'{pct_5d:.1f}% ({_pt(3, k)}分)'
 
-    # 3) 中长期趋势 - 60日涨幅（0~5 分）
+    # 3) 中长期趋势 - 60日涨幅（原 0~5 分）
     pct_60d = row.get('pct_60d', 0)
     if pd.isna(pct_60d):
         pct_60d = 0
     if pct_60d > 10:
-        score += 5; detail['60日趋势'] = f'{pct_60d:.1f}% (5分)'
+        score += _pt(5, k); detail['60日趋势'] = f'{pct_60d:.1f}% ({_pt(5, k)}分)'
     elif pct_60d > 0:
-        score += 3; detail['60日趋势'] = f'{pct_60d:.1f}% (3分)'
+        score += _pt(3, k); detail['60日趋势'] = f'{pct_60d:.1f}% ({_pt(3, k)}分)'
     elif pct_60d > -10:
-        score += 1; detail['60日趋势'] = f'{pct_60d:.1f}% (1分)'
+        score += _pt(1, k); detail['60日趋势'] = f'{pct_60d:.1f}% ({_pt(1, k)}分)'
     else:
-        score += 0; detail['60日趋势'] = f'{pct_60d:.1f}% (0分)'
+        score += _pt(0, k); detail['60日趋势'] = f'{pct_60d:.1f}% (0分)'
 
-    # 4) 量比（0~4 分）
+    # 4) 量比（原 0~4 分）
     vr = row.get('volume_ratio', 0)
     if pd.isna(vr):
         vr = 0
     if 1.5 <= vr <= 4:
-        score += 4; detail['量比'] = f'{vr:.2f} (4分)'
+        score += _pt(4, k); detail['量比'] = f'{vr:.2f} ({_pt(4, k)}分)'
     elif 1 <= vr < 1.5:
-        score += 2; detail['量比'] = f'{vr:.2f} (2分)'
+        score += _pt(2, k); detail['量比'] = f'{vr:.2f} ({_pt(2, k)}分)'
     elif vr > 4:
-        score += 2; detail['量比'] = f'{vr:.2f} 巨量 (2分)'
+        score += _pt(2, k); detail['量比'] = f'{vr:.2f} 巨量 ({_pt(2, k)}分)'
     else:
-        score += 0; detail['量比'] = f'{vr:.2f} (0分)'
+        score += _pt(0, k); detail['量比'] = f'{vr:.2f} (0分)'
+
+    # 5) 趋势线（锚定 MA120）—— 新增项
+    if tier == 'full':
+        score += MA_TREND_FULL
+        detail['趋势线'] = f'MA5>年线 且价≥年线 ({MA_TREND_FULL}分)'
+    elif tier == 'pass':
+        score += MA_TREND_PASS
+        detail['趋势线'] = f'MA5>MA20 ({MA_TREND_PASS}分)'
+    elif tier == 'none':
+        detail['趋势线'] = 'MA5≤MA20 (0分)'
+    else:
+        detail['趋势线'] = '数据不足·不计分'
 
     return min(score, SCORE_WEIGHTS['technical']), detail
 
@@ -430,7 +495,11 @@ def analyze_sector_heat(df: pd.DataFrame, top_n: int = 3) -> List[Dict]:
         return []
 
     # 确保数值列可用
-    df['pct_change'] = pd.to_numeric(df.get('pct_change', 0), errors='coerce').fillna(0)
+    # ⚠️ 与 analyze_sector_leaders 同样的列缺失陷阱：`df.get('pct_change', 0)` 返回标量 0 →
+    #    .fillna() 抛 AttributeError。此处补列存在判断（纯健壮性，正常链路行为不变）。
+    if 'pct_change' not in df.columns:
+        df['pct_change'] = 0.0
+    df['pct_change'] = pd.to_numeric(df['pct_change'], errors='coerce').fillna(0)
     if 'main_net_inflow' not in df.columns:
         df['main_net_inflow'] = 0.0
     df['main_net_inflow'] = pd.to_numeric(df['main_net_inflow'], errors='coerce').fillna(0)
@@ -454,6 +523,135 @@ def analyze_sector_heat(df: pd.DataFrame, top_n: int = 3) -> List[Dict]:
 
     result.sort(key=lambda x: x['strength'], reverse=True)
     return result[:top_n]
+
+
+def tag_sector(name: str, industry: str = '') -> str:
+    """板块归类（两级匹配）。
+
+    1) 优先热门题材关键词（HOT_THEMES，人工维护的概念题材）
+    2) 未命中 → 回退 Tushare 行业分类（industry）
+    3) 都拿不到 → 「其他」
+
+    背景：原 tag_theme 只做第 1 级，实测全市场覆盖率仅约 13%（705/5550）。
+    """
+    t = tag_theme(str(name))
+    if t != '其他':
+        return t
+    ind = str(industry).strip() if industry is not None else ''
+    if ind and ind.lower() != 'nan' and ind != '其他':
+        return ind
+    return '其他'
+
+
+def analyze_sector_leaders(df: pd.DataFrame, top_n: int = 3,
+                           min_cnt: int = 3,
+                           industry_map: Dict[str, str] = None) -> Dict[str, List[Dict]]:
+    """把「板块温度」单一混合榜**拆成三个独立榜**（涨幅 / 资金 / 涨停）。
+
+    背景（2026-09-17 实测，脚本 `_ts_sector_heat_probe.py`）：
+      原 strength = 平均涨幅×0.4 + max(主力净流入,0)×0.3 + 涨停数×0.3，
+      三项量纲分别是 %（摆动 3.8）/ 亿（摆动 124）/ 只（摆动 2），
+      加权后实际摆动幅度 = 1.52 / 37.25 / 0.60 分
+      → **资金项话语权是涨幅的 24.5 倍**，实测 TOP1 半导体 96.3% 贡献来自资金，
+        「板块温度」名不副实（实为资金榜）。
+      → 本函数不再做混合加权，改为**三榜独立排序**：口径透明、无参数争议、
+        也不会出现「下跌板块排在上涨板块前面」的困惑。
+
+    参数：
+      df           需含 name / pct_change / main_net_inflow，可选 code / industry
+      top_n        每榜返回条数
+      min_cnt      板块成分股下限（行业兜底后会混入只有 1~2 只的细行业 → 噪声）
+      industry_map 6 位代码 → 行业；缺省时自动获取（失败则退化为纯题材匹配）
+
+    返回 {'gainers': [...], 'flows': [...], 'limit_ups': [...], 'all': [...], 'coverage': {...}}
+    """
+    if df is None or df.empty:
+        return {'gainers': [], 'flows': [], 'limit_ups': [], 'all': [], 'coverage': {}}
+
+    d = df.copy()
+    if 'name' not in d.columns:
+        d['name'] = ''
+    if 'code' in d.columns:
+        codes = d['code'].astype(str).str.zfill(6)
+    else:
+        codes = pd.Series([''] * len(d), index=d.index)
+
+    if industry_map is None:
+        try:
+            from .data_fetcher import fetch_industry_map
+            industry_map = fetch_industry_map() or {}
+        except Exception:
+            industry_map = {}
+
+    if 'industry' in d.columns:
+        inds = [str(x) for x in d['industry'].tolist()]
+    else:
+        inds = [industry_map.get(c, '') for c in codes]
+    d['_sector'] = [tag_sector(n, i) for n, i in zip(d['name'].astype(str), inds)]
+
+    # ⚠️ 必须先判列存在再取值：`d.get('col', 0)` 在列缺失时返回**标量 0**（不是 Series），
+    #    紧接着的 .fillna() 会抛 AttributeError: 'int' object has no attribute 'fillna'。
+    #    （与项目里 `row.get(k,0)` 返回 None 的陷阱同类）
+    if 'pct_change' not in d.columns:
+        d['pct_change'] = 0.0
+    d['pct_change'] = pd.to_numeric(d['pct_change'], errors='coerce').fillna(0.0)
+    if 'main_net_inflow' not in d.columns:
+        d['main_net_inflow'] = 0.0
+    d['main_net_inflow'] = pd.to_numeric(d['main_net_inflow'], errors='coerce').fillna(0.0)
+
+    total = len(d)
+    tagged = int((d['_sector'] != '其他').sum())
+
+    rows = []
+    for sector, g in d.groupby('_sector'):
+        if sector == '其他':
+            continue
+        rows.append({
+            'theme': sector,
+            'avg_pct': float(g['pct_change'].mean()),
+            'inflow_yi': float(g['main_net_inflow'].sum()) / 1e8,
+            'limit_up': int((g['pct_change'] >= 9.8).sum()),
+            'cnt': len(g),
+        })
+    if not rows:
+        # ⚠️ 该分支必须与下方成功分支的 coverage 字段**完全一致**，否则「一只都没归类上」
+        #    这种最该提示降级的情况下，报告侧反而拿不到 industry_downgraded → 静默无提示。
+        return {'gainers': [], 'flows': [], 'limit_ups': [], 'all': [],
+                'coverage': {'total': total, 'tagged': tagged, 'ratio': 0.0,
+                             'n_sector': 0, 'min_cnt': min_cnt,
+                             'industry_downgraded': not bool(industry_map)}}
+
+    t = pd.DataFrame(rows)
+    t = t[t['cnt'] >= max(1, int(min_cnt))]
+    if t.empty:                       # 门槛过严 → 退回不过滤
+        t = pd.DataFrame(rows)
+
+    def _pack(frame):
+        out = []
+        for _, r in frame.iterrows():
+            out.append({
+                'theme': r['theme'],
+                'avg_pct': round(float(r['avg_pct']), 2),
+                'inflow_yi': round(float(r['inflow_yi']), 1),
+                'limit_up': int(r['limit_up']),
+                'cnt': int(r['cnt']),
+            })
+        return out
+
+    return {
+        'gainers': _pack(t.sort_values(['avg_pct', 'cnt'], ascending=[False, False]).head(top_n)),
+        'flows': _pack(t.sort_values(['inflow_yi', 'cnt'], ascending=[False, False]).head(top_n)),
+        'limit_ups': _pack(t.sort_values(['limit_up', 'avg_pct'], ascending=[False, False]).head(top_n)),
+        'all': _pack(t.sort_values('avg_pct', ascending=False)),
+        'coverage': {
+            'total': total,
+            'tagged': tagged,
+            'ratio': round(tagged * 100.0 / total, 1) if total else 0.0,
+            'n_sector': int(len(t)),
+            'min_cnt': int(min_cnt),
+            'industry_downgraded': not bool(industry_map),
+        },
+    }
 
 
 # ============================================================
