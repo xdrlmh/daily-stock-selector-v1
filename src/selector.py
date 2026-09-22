@@ -10,7 +10,10 @@
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional
-from .config import SCORE_WEIGHTS, CONFIG
+from .config import (SCORE_WEIGHTS, CONFIG, CAPITAL_MODE, CAPITAL_TREND_FILTER,
+                     CAPITAL_MIN_VALID_DAYS, CAPITAL_MISSING_ZERO_SCOPE,
+                     CAPITAL_ELG_FULL, CAPITAL_ELG_PARTIAL,
+                     CAPITAL_ELG_NONE, CAPITAL_RATIO_BANDS)
 from .data_fetcher import fetch_history_kline
 
 
@@ -155,8 +158,149 @@ def calc_tech_score(row: pd.Series) -> Tuple[float, Dict]:
 # ============================================================
 # 二、资金面评分（20 分）
 # ============================================================
+def _yi(wan) -> str:
+    """万元 → 亿元字符串，并消除「-0.00」（负零在报告里会被误读为净流出）"""
+    y = round(float(wan or 0.0) / 1e4, 2)
+    if y == 0:
+        y = 0.0
+    return f'{y:+.2f}亿'
+
+
+def _num(row: pd.Series, key: str):
+    """安全取数：缺失/NaN/非数 → None（区别于 0，用于「无信号」判定）"""
+    if key not in row:
+        return None
+    v = row.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
+
+
+def capital_data_ok(row: pd.Series) -> bool:
+    """该股近 5 日资金面数据是否足够判定（≥ CAPITAL_MIN_VALID_DAYS 天）。
+
+    ⚠️ 门槛存在的理由（实测）：停牌/次新股近 5 日只有 2 天数据时，占比会被算成
+    76% 这种虚高值（例：600825 仅 2 天数据 → 排到占比第一）。这类样本属于
+    **数据质量假信号**，一律按「无信号」处理。
+    """
+    d = _num(row, 'elg_days_5d')
+    return d is not None and d >= CAPITAL_MIN_VALID_DAYS
+
+
+def is_capital_trend_ok(row: pd.Series) -> bool:
+    """资金面趋势**硬门槛**：近 5 日日均超大单净额 > 近 60 日日均 且 > 0。
+
+    实测支撑（主板 3168 只 × 7 个信号日）：不过滤的超额 −5.42%（原口径）；
+    过滤后 −0.87%；通过率约 34% → 候选池仍 ~1000 只，不会卡死。
+
+    ★ 以下两种情况返回 True（**不拦截**）：
+      ① 面板整体不可用（列缺失）→ 降级，与均线面板「取不到就退回原口径」同哲学；
+      ② 该股近 5 日有效数据不足 → **无法判定**（次新/停牌），不据此剔除，
+         但资金面会自然给 0 分（用户拍板：数据不足即 0 分，而非排除）。
+    """
+    if 'elg_5d_avg' not in row or 'elg_60d_avg' not in row:
+        return True                                   # ① 降级：不拦截
+    if not capital_data_ok(row):
+        return True                                   # ② 无法判定：不拦截
+    e5 = _num(row, 'elg_5d_avg')
+    e60 = _num(row, 'elg_60d_avg')
+    if e5 is None or e60 is None:
+        return True
+    return e5 > e60 and e5 > 0
+
+
 def calc_capital_score(row: pd.Series) -> Tuple[float, Dict]:
-    """主力资金净流入 + 换手率合理性"""
+    """资金面 20 分 = 超大单趋势 10 + 超大单占比 4 + 换手率合理性 6（CAPITAL_MODE=elg）
+
+    ★ 改造背景（2026-09-22）：原「当日主力净流入」前 5% 在主板 3168 只 × 7 个信号日上
+      **7/7 全负超额**（平均 −5.42%），是典型的「当日放量大涨 → 追高」；而「净额/成交额
+      占比」排序 −1.61% ≫「绝对净额」排序 −4.54%，故改用占比而非绝对额。
+    ⚠️ 占比项只有 4 分（非主导）：实测「占比前5%」(−1.61%) 并不优于「过滤后全部」
+      (−0.87%)，即占比**用于剔除有害项有余、用于选出赢家不足** → 保留话语权但不当主导。
+    `CAPITAL_MODE=legacy` 时逐行回到旧口径（当日主力净流入 0~14 + 换手 0~6）。
+    """
+    if CAPITAL_MODE != 'elg':
+        return _calc_capital_score_legacy(row)
+
+    score = 0
+    detail = {}
+
+    # 1) 超大单趋势确认（0~10 分）
+    if not capital_data_ok(row):
+        # ★ 数据不足（次新/停牌）：视为「无信号」。
+        #   默认（CAPITAL_MISSING_ZERO_SCOPE='all'）整个资金面 20 分归零 —— 即用户拍板的
+        #   「资金面给 0 分」字面口径；置为 'elg_only' 时只归零超大单两项、换手率照常。
+        detail = {'超大单趋势': f'数据不足（<{CAPITAL_MIN_VALID_DAYS}日）(0分)',
+                  '超大单占比': '数据不足 (0分)'}
+        if CAPITAL_MISSING_ZERO_SCOPE == 'all':
+            detail['换手率'] = '数据不足 · 资金面整体归零 (0分)'
+            return 0, detail
+        turnover = row.get('turnover_rate', 0)
+        if pd.isna(turnover):
+            turnover = 0
+        if 3 <= turnover <= 10:
+            score += 6; detail['换手率'] = f'{turnover:.1f}% (6分)'
+        elif 10 < turnover <= 20:
+            score += 3; detail['换手率'] = f'{turnover:.1f}% (3分)'
+        elif turnover > 20:
+            score += 1; detail['换手率'] = f'{turnover:.1f}% 过热 (1分)'
+        else:
+            score += 2; detail['换手率'] = f'{turnover:.1f}% (2分)'
+        return min(score, SCORE_WEIGHTS['capital']), detail
+    else:
+        e5 = _num(row, 'elg_5d_avg')
+        e60 = _num(row, 'elg_60d_avg')
+        if e5 is None or e60 is None:
+            score += CAPITAL_ELG_NONE
+            detail['超大单趋势'] = '缺失 (0分)'
+        elif e5 > e60 and e5 > 0:
+            score += CAPITAL_ELG_FULL
+            detail['超大单趋势'] = f'5日日均{_yi(e5)} > 60日{_yi(e60)} (10分)'
+        elif e5 > 0:
+            score += CAPITAL_ELG_PARTIAL
+            detail['超大单趋势'] = f'5日日均{_yi(e5)} 未放大 (5分)'
+        else:
+            score += CAPITAL_ELG_NONE
+            detail['超大单趋势'] = f'5日日均{_yi(e5)} 净流出 (0分)'
+
+        # 2) 超大单占比强度（0~4 分）：近 5 日净额 / 近 5 日成交额
+        ratio = _num(row, 'elg_ratio_5d')
+        if ratio is None:
+            detail['超大单占比'] = '缺失 (0分)'
+        else:
+            got = 0
+            for lo, pts in CAPITAL_RATIO_BANDS:
+                if ratio > lo:
+                    got = pts
+                    break
+            score += got
+            detail['超大单占比'] = f'{ratio:+.2f}% ({got}分)'
+
+    # 3) 换手率（0~6 分）—— 沿用原口径，一行未改
+    turnover = row.get('turnover_rate', 0)
+    if pd.isna(turnover):
+        turnover = 0
+    if 3 <= turnover <= 10:
+        score += 6; detail['换手率'] = f'{turnover:.1f}% (6分)'
+    elif 10 < turnover <= 20:
+        score += 3; detail['换手率'] = f'{turnover:.1f}% (3分)'
+    elif turnover > 20:
+        score += 1; detail['换手率'] = f'{turnover:.1f}% 过热 (1分)'
+    else:
+        score += 2; detail['换手率'] = f'{turnover:.1f}% (2分)'
+
+    return min(score, SCORE_WEIGHTS['capital']), detail
+
+
+def _calc_capital_score_legacy(row: pd.Series) -> Tuple[float, Dict]:
+    """旧口径（CAPITAL_MODE=legacy）：主力资金净流入 + 换手率合理性。
+
+    ⚠️ 本函数是改造前的**逐行原样保留**，仅供回退对照使用 —— 改动前请勿修改。
+    """
     score = 0
     detail = {}
 
@@ -418,11 +562,26 @@ def is_capital_outflow(row: pd.Series) -> bool:
 def screen_stocks(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     主筛选函数：返回 (TOP 5, 警示名单, 其余候选)
+
+    ⚠️ 与改版前的唯一差异 = **资金面趋势硬门槛**（`CAPITAL_MODE=elg` 时启用）：
+       不满足「近5日日均超大单净额 > 近60日日均 且 >0」的票**直接从候选池剔除**，
+       不占 TOP5 名额（与实证口径一致）。取不到面板数据时自动跳过该门槛。
     """
     if df.empty:
         return df, df, df
 
     print(f'\n🔍 开始评分 {len(df)} 只候选股票...')
+
+    # ★ 资金面趋势硬门槛（因子条件，非风险条件；被剔除的票不进警示名单）
+    if CAPITAL_MODE == 'elg' and CAPITAL_TREND_FILTER and 'elg_5d_avg' in df.columns:
+        n_before = len(df)
+        _keep = df[df.apply(is_capital_trend_ok, axis=1)]
+        if _keep.empty:
+            print('  ⚠️ 资金面趋势门槛后无候选 → 视为数据异常，**本次不启用该门槛**（避免空跑）')
+        else:
+            df = _keep
+            print(f'  🚦 资金面趋势门槛（近5日日均 > 近60日日均 且 >0）：'
+                  f'{n_before} → {len(df)} 只（剔除 {n_before - len(df)} 只）')
 
     # 计算每只股票的总分
     scores = []
