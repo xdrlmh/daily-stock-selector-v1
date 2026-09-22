@@ -211,6 +211,21 @@ def capital_state(row) -> str:
     return 'inflow'
 
 
+def capital_detail_lines(row) -> List[str]:
+    """个股明细里的资金面两行（新口径 = 超大单 5日日均 + 占成交额；legacy = 当日主力净额）。"""
+    if CAPITAL_MODE != 'elg':
+        return [f'- 主力净流入：{format_yi(row.get("main_net_inflow", 0))}']
+    e5 = safe_float(row.get('elg_5d_avg'))
+    e60 = safe_float(row.get('elg_60d_avg'))
+    r = safe_float(row.get('elg_ratio_5d'))
+    if e5 is None:
+        return ['- 超大单 5日日均：数据不足（次新/停牌）']
+    out = [f'- 超大单 5日日均：**{_yi(e5)}**' + (f'（60日 {_yi(e60)}）' if e60 is not None else '')]
+    if r is not None:
+        out.append(f'- 超大单占成交额：**{r:+.2f}%**')
+    return out
+
+
 def capital_tips(row) -> List[str]:
     """「操作指引」里的资金面子项（新口径：5日/60日趋势 + 占比强度）。"""
     if CAPITAL_MODE != 'elg':
@@ -1167,7 +1182,9 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
     lines.append('| 维度 | 权重 | 评分要点 |')
     lines.append('|---|---|---|')
     lines.append('| 技术面 | 25% | 当日涨幅、5日涨幅、60日趋势、量比、**趋势线(MA120)** |')
-    lines.append('| 资金面 | 20% | 主力净流入、换手率 |')
+    lines.append('| 资金面 | 20% | ' + (
+        '**超大单5日/60日趋势**、超大单占成交额、换手率' if CAPITAL_MODE == 'elg'
+        else '主力净流入、换手率') + ' |')
     lines.append('| 估值 | 15% | PE-TTM、PB |')
     lines.append('| 题材催化 | 15% | 热门主题、当日关注度 |')
     lines.append('| 基本面 | 25% | 业绩（PE 间接）、市值、稳定性 |')
@@ -1188,7 +1205,7 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
             lines.append(f'- 量比：{format_num(row.get("volume_ratio"), ".2f")}')
             lines.append(f'- PE-TTM：{format_num(row.get("pe_ttm"), ".1f")}')
             lines.append(f'- 流通市值：{format_mcap_yi(row.get("circ_mcap"))}')
-            lines.append(f'- 主力净流入：{format_yi(row.get("main_net_inflow", 0))}')
+            lines.extend(capital_detail_lines(row))
             lines.append('')
             lines.append(f'**综合评分：{format_num(row.get("total_score"), ".0f")}/100**')
             lines.append('')
@@ -1239,8 +1256,18 @@ def save_full_report(date_str: str, top_picks: pd.DataFrame,
         avg_turnover = all_stocks['turnover_rate'].mean()
         if not pd.isna(avg_turnover):
             lines.append(f'- **市场平均换手**：{avg_turnover:.2f}%')
-        main_inflow_total = all_stocks['main_net_inflow'].sum() / 1e8
-        lines.append(f'- **主力净流入合计**：{main_inflow_total:+.1f}亿')
+        # 资金面合计：按口径分派；**列缺失时不打印该行**（不抛异常，兼容裁剪后的候选池）
+        if CAPITAL_MODE == 'elg':
+            if 'elg_5d_sum' in all_stocks.columns:
+                _elg_total = pd.to_numeric(all_stocks['elg_5d_sum'],
+                                           errors='coerce').sum() / 1e4   # 万元 → 亿元
+                if not pd.isna(_elg_total):
+                    lines.append(f'- **候选池超大单 5 日净额合计**：{_elg_total:+.1f}亿')
+        elif 'main_net_inflow' in all_stocks.columns:
+            _mnf_total = pd.to_numeric(all_stocks['main_net_inflow'],
+                                       errors='coerce').sum() / 1e8
+            if not pd.isna(_mnf_total):
+                lines.append(f'- **主力净流入合计**：{_mnf_total:+.1f}亿')
         lines.append('')
 
     # 免责声明
@@ -1323,7 +1350,7 @@ def save_review_report(date_str: str, top_picks: pd.DataFrame,
             lines.append(f'- 量比：{format_num(row.get("volume_ratio"), ".2f")}')
             lines.append(f'- PE-TTM：{format_num(row.get("pe_ttm"), ".1f")}')
             lines.append(f'- 流通市值：{format_mcap_yi(row.get("circ_mcap"))}')
-            lines.append(f'- 主力净流入：{format_yi(row.get("main_net_inflow", 0))}')
+            lines.extend(capital_detail_lines(row))
             lines.append('')
             lines.append(f'**综合评分：{format_num(row.get("total_score"), ".0f")}/100**')
             lines.append('')
