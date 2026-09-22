@@ -12,15 +12,15 @@ import tushare as ts
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import warnings
 
 try:
     from .config import (CAPITAL_MODE, CAPITAL_SHORT_DAYS, CAPITAL_LONG_DAYS,
-                         CAPITAL_MIN_VALID_DAYS)
+                         CAPITAL_MIN_VALID_DAYS, CAPITAL_DAY_RATIO_CAP)
 except ImportError:      # 直接运行本文件时（python src/data_fetcher.py）
     from config import (CAPITAL_MODE, CAPITAL_SHORT_DAYS, CAPITAL_LONG_DAYS,
-                        CAPITAL_MIN_VALID_DAYS)
+                        CAPITAL_MIN_VALID_DAYS, CAPITAL_DAY_RATIO_CAP)
 
 warnings.filterwarnings('ignore')
 
@@ -895,6 +895,23 @@ def fetch_moneyflow_panel() -> pd.DataFrame:
     d60 = ECOL[-CAPITAL_LONG_DAYS:]
     assert max(d5) <= window[0] and max(d60) <= window[0], '★ 资金面前视检查失败'
 
+    # 3.5) ★ 单日占比上限（软截顶，用户拍板 2026-09-23）
+    #      每日超大单净额 ≤ 当日成交额 × CAP%  ⇒ 5 日占比上界 = CAP%
+    #      作用在**上游序列**：趋势项（e5/e60）与占比项**同时**受益。
+    #      实测「只截趋势项」无效（超额 −1.1~−2.2%）⇒ 必须同时覆盖占比项。
+    if CAPITAL_DAY_RATIO_CAP and CAPITAL_DAY_RATIO_CAP > 0:
+        if amt_mat is not None and not amt_mat.empty:
+            elg_mat, _cap_info = _apply_day_ratio_cap(elg_mat, amt_mat, CAPITAL_DAY_RATIO_CAP)
+            _win = [d for d in (d5 + d60) if d in _cap_info['mask'].index]
+            _hit = int(_cap_info['mask'].loc[_win].sum().sum())
+            print('  ✂️ 单日占比上限 %.1f%%：截顶 %d 个「股票×日」单元'
+                  '（窗口内 %d 个 ｜ 有成交额可比 %d 个）'
+                  % (CAPITAL_DAY_RATIO_CAP, _cap_info['capped_cells'], _hit,
+                     _cap_info['cells_with_amt']))
+        else:
+            print('  ⚠️ 单日占比上限已启用（%.1f%%）但**无成交额矩阵** → 本次跳过截顶（降级）'
+                  % CAPITAL_DAY_RATIO_CAP)
+
     # 4) 逐股聚合（★ 全部按各自矩阵的日期集合切，不用跨表索引位置；
     #    ★★ 所有结果统一 reindex 到 elg_mat.columns —— 资金流与日线两份矩阵的
     #    代码集合并不相同（有日线无资金流 / 反之），不 reindex 会「数组长度不一致」）
@@ -953,6 +970,34 @@ def fetch_moneyflow_panel() -> pd.DataFrame:
           '用时 %.0f 秒（%d 个交易日）'
           % (len(out), ok, len(trend), len(trend) / len(out) * 100, time.time() - t0, got))
     return out
+
+
+def _apply_day_ratio_cap(elg_mat: pd.DataFrame, amt_mat: pd.DataFrame,
+                         cap_pct: float) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """★ 单日占比上限（软截顶）：`elg_i ← min(elg_i, amt_i × cap_pct / 1000)`。
+
+    单位：`moneyflow.*_amount` = **万元**，`daily.amount` = **千元**
+      ⇒ 上限(万元) = amt(千元) × cap_pct% / 100% / 10 = amt × cap_pct / 1000
+      （`elg/amt × 10 × 100` = 占比%，令占比 ≤ cap_pct 反解即得）
+
+    ★ 只在 **elg 与 amt 都有效**处截顶：任一为 NaN 时**保持原值**（不把 NaN 填成上限）。
+    ★ amt 缺失的「日期×股票」单元自动跳过 ⇒ 降级为「部分截顶」，不报错。
+
+    返回 (截顶后矩阵, {'capped_cells','cells_with_amt','mask'})；索引/列与原矩阵一致。
+    """
+    A = amt_mat.reindex(index=elg_mat.index, columns=elg_mat.columns)
+    ceiling = A.astype('float64') * float(cap_pct) / 1000.0        # 万元
+    E = elg_mat.to_numpy(dtype='float64', copy=True)
+    C = ceiling.to_numpy(dtype='float64', copy=True)
+    mask = np.isfinite(E) & np.isfinite(C) & (E > C)
+    out = E.copy()
+    out[mask] = C[mask]
+    capped = pd.DataFrame(out, index=elg_mat.index, columns=elg_mat.columns)
+    return capped, {
+        'capped_cells': int(mask.sum()),
+        'cells_with_amt': int(np.isfinite(C).sum()),
+        'mask': pd.DataFrame(mask, index=elg_mat.index, columns=elg_mat.columns),
+    }
 
 
 def _fetch_amount_matrix(pro: Any, dates: List[str]) -> pd.DataFrame:
