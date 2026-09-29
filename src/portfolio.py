@@ -173,9 +173,18 @@ MARKET_FUSE_BLOCK_REFILL = _env_bool('MARKET_FUSE_BLOCK_REFILL', True)  # 熔断
 #   所以语义是「**昨天**大盘跌得狠 → 今天先不补仓」，与晚间复盘的当日熔断是两回事。
 # ★ 作用范围：**只拦补仓/新开仓**。买入信号生成、以及全部离场动作（①止损 ②破MA20 ④破MA10）
 #   **均不受影响** —— 弱势不改变已有持仓的止损纪律。
-# ★ 失败安全：指数涨跌幅取不到（None/NaN/非法值）→ **照常补仓**，不因取数失败停摆。
+# ★★ 失败安全（2026-09-29 用户拍板，**风控优先**）：指数涨跌幅取不到（None/NaN/非法值）
+#   → **一律暂停补仓**。
+#   理由：「取数失败」往往正伴随 Tushare/链路异常，此时大盘状态**未知**；
+#         在未知状态下开新仓属于**无依据加仓**，宁可少开一次仓，不可盲目接飞刀。
+#   ⚠️ 与 `market_fuse_check`（当日熔断）**方向相反**，两者**不要合并**：
+#      当日熔断的作用域含「暂缓破MA10减半」＝ **少减仓**，
+#      若也按"取数失败就熔断"，等于因数据缺失而**放大风险敞口**，故它保持"失败→不熔断"。
+#   回退：`MORNING_REFILL_FUSE_FAILSAFE=0` → 恢复为「取数失败照常补仓」。
 MORNING_REFILL_FUSE_ENABLED = _env_bool('MORNING_REFILL_FUSE_ENABLED', True)
 MORNING_REFILL_FUSE_DROP_PCT = _env_float('MORNING_REFILL_FUSE_DROP_PCT', MARKET_FUSE_DROP_PCT)
+# ★ 取数失败是否也拦（默认 on）；关掉 = 旧行为（失败放行、不阻塞补仓）
+MORNING_REFILL_FUSE_FAILSAFE = _env_bool('MORNING_REFILL_FUSE_FAILSAFE', True)
 
 STATUS_TEXT = {
     'stop_loss': '🚨 触发止损',
@@ -448,37 +457,50 @@ def market_fuse_check(index_pct_change: Optional[float],
     return False, ''
 
 
+MORNING_REFILL_FAIL_MSG = ('⚠️ 昨日大盘涨跌幅取数失败（数据缺失/非法值）'
+                           ' → 风控保守处理：今日暂停补仓/新开仓；'
+                           '已有持仓的离场纪律不受影响')
+
+
 def morning_refill_fuse_check(prev_index_pct_change: Optional[float],
                              enabled: Optional[bool] = None,
-                             drop_pct: Optional[float] = None):
+                             drop_pct: Optional[float] = None,
+                             failsafe: Optional[bool] = None):
     """早盘补仓的「昨日弱势」闸门（2026-09-29 用户拍板）。
 
     ★ 与 market_fuse_check **有意分开**（勿合并）：
       - 时点：早盘 08:35，当日行情尚未产生 → 传入值**天然是上一交易日**的涨跌幅
       - 作用范围：**只有「暂停补仓/新开仓」**，不涉及任何离场动作
       - 文案：明写「昨日」，避免与晚间复盘的当日熔断互相混淆
+      - ★ **失败安全方向相反**：本闸门「取数失败 → 拦」（保守，不下无依据的单）；
+        当日熔断「取数失败 → 放行」（因其作用域含「暂缓破MA10减半」＝少减仓，
+        失败即熔断等于因缺数据而**放大风险敞口**）。
 
     - prev_index_pct_change：上证指数**上一交易日**涨跌幅（%），
       直接来自 fetch_market_overview()['index_pct_change']（其锚点即「最近一个已发布数据的交易日」）
-    - None / NaN / 非法值 → **不暂停**（取数失败时不阻塞正常补仓）
+    - None / NaN / 非法值 → **暂停补仓**（风控保守，2026-09-29 用户拍板）；
+      传 `failsafe=False` 可恢复旧行为（取数失败 → 照常补仓）
     - 返回 (是否暂停补仓, 说明文案)
 
     例：昨日上证 −2.35% 且阈值 −2.0% → (True, '昨日 上证指数 −2.35%（≤−2.0%）→ 今日暂停补仓…')
+       昨日涨跌幅取不到            → (True, '⚠️ 昨日大盘涨跌幅取数失败… → 风控保守处理…')
     """
     if enabled is None:
         enabled = MORNING_REFILL_FUSE_ENABLED
     if drop_pct is None:
         drop_pct = MORNING_REFILL_FUSE_DROP_PCT
+    if failsafe is None:
+        failsafe = MORNING_REFILL_FUSE_FAILSAFE
     if not enabled:
-        return False, ''
+        return False, ''          # 闸门整条停用 → 连失败也不拦（零成本回退）
     if prev_index_pct_change is None:
-        return False, ''
+        return (True, MORNING_REFILL_FAIL_MSG) if failsafe else (False, '')
     try:
         pct = float(prev_index_pct_change)
     except (TypeError, ValueError):
-        return False, ''
+        return (True, MORNING_REFILL_FAIL_MSG) if failsafe else (False, '')
     if pct != pct:          # NaN 自比不相等
-        return False, ''
+        return (True, MORNING_REFILL_FAIL_MSG) if failsafe else (False, '')
     if pct <= drop_pct:
         return True, (f'昨日 {MARKET_FUSE_INDEX} {pct:+.2f}%（≤{drop_pct:.1f}%）'
                       f' → 今日暂停补仓/新开仓；已有持仓的离场纪律不受影响')
