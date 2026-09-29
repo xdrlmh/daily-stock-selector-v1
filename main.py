@@ -101,13 +101,15 @@ def main():
     # 7.1b 早盘补仓闸门判定（2026-09-29）：08:35 取到的 index_pct_change
     #      **天然是上一交易日**的涨跌幅（取数锚点＝最近一个已发布数据的交易日）
     #      ⇒ 昨日上证跌幅 ≤ 阈值 → 今日暂停补仓/新开仓。
-    #      ⚠️ 只拦补仓，**不影响任何离场动作**；取数失败 → 不暂停（照常补仓）。
+    #      ⚠️ 只拦补仓，**不影响任何离场动作**；
+    #      ★ 取数失败 → **一律暂停补仓**（风控保守：大盘状态未知时不下无依据的单，2026-09-29 拍板）。
     refill_fused, refill_fuse_msg = morning_refill_fuse_check(market.get('index_pct_change'))
     market['refill_fused'] = refill_fused
     market['refill_fuse_msg'] = refill_fuse_msg
     # 两个分支都打日志 → 真机日志可**明确看到闸门已执行**，不必靠"没输出"反推
+    # ⚠️ 文案刻意不写"触发"：取数失败也会进这一支，写"触发"会被误读成"昨日确实跌超阈值"
     if refill_fused:
-        log.warning(f'⚡ 早盘补仓闸门：触发 —— {refill_fuse_msg}')
+        log.warning(f'⛔ 早盘补仓闸门：今日不补仓 —— {refill_fuse_msg}')
     else:
         _prev_pct = market.get('index_pct_change')
         log.info(f'🛒 早盘补仓闸门：未触发'
