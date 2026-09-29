@@ -34,7 +34,8 @@ from src.data_fetcher import (
 from src.selector import screen_stocks, fallback_from_top_gainers
 from src.report import generate_dingtalk_payload, save_full_report, elg_cell
 from src.notifier import push_all, summarize
-from src.portfolio import fill_portfolio_from_candidates, get_active_holdings, MAX_HOLDINGS
+from src.portfolio import (fill_portfolio_from_candidates, get_active_holdings, MAX_HOLDINGS,
+                           morning_refill_fuse_check, MORNING_REFILL_FUSE_DROP_PCT)
 
 
 # 日志配置
@@ -97,6 +98,22 @@ def main():
     # 7.1 大盘环境（上证指数 + 主力净额 + 60日趋势）
     market = fetch_market_overview()
 
+    # 7.1b 早盘补仓闸门判定（2026-09-29）：08:35 取到的 index_pct_change
+    #      **天然是上一交易日**的涨跌幅（取数锚点＝最近一个已发布数据的交易日）
+    #      ⇒ 昨日上证跌幅 ≤ 阈值 → 今日暂停补仓/新开仓。
+    #      ⚠️ 只拦补仓，**不影响任何离场动作**；取数失败 → 不暂停（照常补仓）。
+    refill_fused, refill_fuse_msg = morning_refill_fuse_check(market.get('index_pct_change'))
+    market['refill_fused'] = refill_fused
+    market['refill_fuse_msg'] = refill_fuse_msg
+    # 两个分支都打日志 → 真机日志可**明确看到闸门已执行**，不必靠"没输出"反推
+    if refill_fused:
+        log.warning(f'⚡ 早盘补仓闸门：触发 —— {refill_fuse_msg}')
+    else:
+        _prev_pct = market.get('index_pct_change')
+        log.info(f'🛒 早盘补仓闸门：未触发'
+                 f'（昨日上证 {("%+.2f%%" % _prev_pct) if _prev_pct is not None else "数据缺失"}'
+                 f'，阈值 ≤{MORNING_REFILL_FUSE_DROP_PCT:.1f}%）')
+
     # 7.2 钉钉消息 payload
     dingtalk_payload = generate_dingtalk_payload(
         date_str=date_str,
@@ -131,8 +148,13 @@ def main():
             log.error('❌ 所有通道推送均失败，请检查 webhook 配置')
 
     # 8.5 自动补仓（持仓上限 MAX_HOLDINGS 只，按评分顺序补齐空仓位）
+    # ⚡ 早盘闸门（7.1b 已判定）：昨日大盘弱 → 今日不补仓（离场动作不受影响）
     if not top_picks.empty:
-        added = fill_portfolio_from_candidates(top_picks, source='morning_screen')
+        if refill_fused:
+            added = []
+            log.warning(f'⚡ 早盘补仓已暂停：{refill_fuse_msg}')
+        else:
+            added = fill_portfolio_from_candidates(top_picks, source='morning_screen')
         log.info(f'🛒 持仓池新增 {len(added)} 只（上限 {MAX_HOLDINGS} 只）')
         active = get_active_holdings()
         log.info(f'📊 当前活跃持仓 {len(active)}/{MAX_HOLDINGS} 只：'
