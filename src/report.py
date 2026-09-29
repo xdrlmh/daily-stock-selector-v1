@@ -433,6 +433,11 @@ def generate_market_section(market: Dict[str, Any]) -> List[str]:
     else:
         lines.append('- **60日趋势**：数据不足')
 
+    # 早盘补仓闸门（2026-09-29）——**仅在触发时**出现，避免正常日噪音
+    # 口径：昨日上证跌幅 ≤ 阈值 → 今日暂停补仓/新开仓（只拦补仓，离场纪律不受影响）
+    if market.get('refill_fused'):
+        lines.append(f'- **⚡ 早盘补仓暂停**：{market.get("refill_fuse_msg", "")}')
+
     return lines
 
 
