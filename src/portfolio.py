@@ -165,6 +165,18 @@ MARKET_FUSE_SCOPE = 'ma10_half'  # 熔断作用范围：仅「破 MA10 减半」
 MARKET_FUSE_BLOCK_REFILL = _env_bool('MARKET_FUSE_BLOCK_REFILL', True)  # 熔断日暂停补仓/新开仓
 # 以上参数支持环境变量覆盖，便于应急调整；云端验证时可用极端阈值（如 99）强制触发熔断来验证拦截路径。
 
+# ============= 早盘补仓「昨日弱势」闸门（2026-09-29 新增，用户拍板）=============
+# ★ 为什么单列一条（而不是复用当日熔断）：
+#   早盘 daily.yml 在 08:35 运行，**当日**指数涨跌幅尚未产生；
+#   而 data_fetcher._get_trade_dates 的锚点是「最近一个已发布数据的交易日」
+#   ⇒ 早盘取到的 index_pct_change **天然就是上一交易日**的涨跌幅。
+#   所以语义是「**昨天**大盘跌得狠 → 今天先不补仓」，与晚间复盘的当日熔断是两回事。
+# ★ 作用范围：**只拦补仓/新开仓**。买入信号生成、以及全部离场动作（①止损 ②破MA20 ④破MA10）
+#   **均不受影响** —— 弱势不改变已有持仓的止损纪律。
+# ★ 失败安全：指数涨跌幅取不到（None/NaN/非法值）→ **照常补仓**，不因取数失败停摆。
+MORNING_REFILL_FUSE_ENABLED = _env_bool('MORNING_REFILL_FUSE_ENABLED', True)
+MORNING_REFILL_FUSE_DROP_PCT = _env_float('MORNING_REFILL_FUSE_DROP_PCT', MARKET_FUSE_DROP_PCT)
+
 STATUS_TEXT = {
     'stop_loss': '🚨 触发止损',
     'ma20_exit': '🔻 破MA20 清仓',
@@ -433,6 +445,43 @@ def market_fuse_check(index_pct_change: Optional[float],
         return True, (f'{MARKET_FUSE_INDEX} {pct:+.2f}%（≤{drop_pct:.1f}%）'
                       f' → 今日暂缓「破MA10减半」{extra}；'
                       f'固定止损 −7% 与破MA20清仓照常执行，大盘企稳后自动补执行')
+    return False, ''
+
+
+def morning_refill_fuse_check(prev_index_pct_change: Optional[float],
+                             enabled: Optional[bool] = None,
+                             drop_pct: Optional[float] = None):
+    """早盘补仓的「昨日弱势」闸门（2026-09-29 用户拍板）。
+
+    ★ 与 market_fuse_check **有意分开**（勿合并）：
+      - 时点：早盘 08:35，当日行情尚未产生 → 传入值**天然是上一交易日**的涨跌幅
+      - 作用范围：**只有「暂停补仓/新开仓」**，不涉及任何离场动作
+      - 文案：明写「昨日」，避免与晚间复盘的当日熔断互相混淆
+
+    - prev_index_pct_change：上证指数**上一交易日**涨跌幅（%），
+      直接来自 fetch_market_overview()['index_pct_change']（其锚点即「最近一个已发布数据的交易日」）
+    - None / NaN / 非法值 → **不暂停**（取数失败时不阻塞正常补仓）
+    - 返回 (是否暂停补仓, 说明文案)
+
+    例：昨日上证 −2.35% 且阈值 −2.0% → (True, '昨日 上证指数 −2.35%（≤−2.0%）→ 今日暂停补仓…')
+    """
+    if enabled is None:
+        enabled = MORNING_REFILL_FUSE_ENABLED
+    if drop_pct is None:
+        drop_pct = MORNING_REFILL_FUSE_DROP_PCT
+    if not enabled:
+        return False, ''
+    if prev_index_pct_change is None:
+        return False, ''
+    try:
+        pct = float(prev_index_pct_change)
+    except (TypeError, ValueError):
+        return False, ''
+    if pct != pct:          # NaN 自比不相等
+        return False, ''
+    if pct <= drop_pct:
+        return True, (f'昨日 {MARKET_FUSE_INDEX} {pct:+.2f}%（≤{drop_pct:.1f}%）'
+                      f' → 今日暂停补仓/新开仓；已有持仓的离场纪律不受影响')
     return False, ''
 
 
